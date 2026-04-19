@@ -1,0 +1,11 @@
+data/
+external_features/
+models/
+output/
+annotations/
+__pycache__/
+*.pyc
+*.npz
+*.pkl
+*.joblib
+.DS_Store
