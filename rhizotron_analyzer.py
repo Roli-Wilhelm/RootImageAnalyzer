@@ -70,8 +70,11 @@ DEFAULT_MIN_LATERAL_PERSISTENCE: int = 40 # px — must travel this far before r
 DEFAULT_MAX_DIAMETER_CV: float = 0.4      # coefficient of variation of diameter along lateral
 DEFAULT_LATERAL_CLF_THRESHOLD: float = 0.7  # stricter P(root) gate applied to laterals only
 DEFAULT_MAX_LATERAL_DENSITY: float = 2.0    # max laterals per cm of parent root length
-DEFAULT_PRE_SKELETON_THRESHOLD: float = 0.30  # classifier P(root) gate applied to mask components before skeletonization
-DEFAULT_MIN_COMPONENT_AREA: int = 500         # px² — mask components smaller than this removed before skeletonization
+DEFAULT_PRE_SKELETON_THRESHOLD: float = 0.65  # classifier P(root) gate applied to mask components before skeletonization
+DEFAULT_MIN_COMPONENT_AREA: int = 2000        # px² — mask components smaller than this removed before skeletonization
+DEFAULT_MIN_STRAIGHTNESS: float = 0.5         # end-to-end / path-length; below this → curly fragment, removed
+DEFAULT_LARGE_ROOT_LENGTH: int = 200          # px — segments longer than this use clf_threshold; shorter use small_root_threshold
+DEFAULT_SMALL_ROOT_THRESHOLD: float = 0.80    # stricter P(root) gate for short skeleton segments
 # Memory estimate per image worker (for --n-jobs tuning):
 #   Full-res 4032×3024 image arrays  ≈  37 MB
 #   ROI patch buffers (400 patches)  ≈   3 MB
@@ -1201,6 +1204,10 @@ def _process_single_roi(
     max_diameter_cv: float = DEFAULT_MAX_DIAMETER_CV,
     lateral_clf_threshold: float = DEFAULT_LATERAL_CLF_THRESHOLD,
     max_lateral_density: float = DEFAULT_MAX_LATERAL_DENSITY,
+    min_straightness: float = DEFAULT_MIN_STRAIGHTNESS,
+    large_root_length: int = DEFAULT_LARGE_ROOT_LENGTH,
+    small_root_threshold: float = DEFAULT_SMALL_ROOT_THRESHOLD,
+    collect_stats: bool = False,
 ) -> Optional[Dict]:
     """
     Process one sliding-window patch and return its feature dict, or None if
@@ -1225,8 +1232,12 @@ def _process_single_roi(
 
     # ── Classifier post-filter (full skeleton) ────────────────────────────────
     if classifier is not None and classifier.is_loaded():
-        filtered_skel = classifier.filter_skeleton(
-            roi_skel, roi_gray, roi_mask, scale, clf_threshold, max_loop_size
+        filtered_skel, flt_stats = classifier.filter_skeleton(
+            roi_skel, roi_gray, roi_mask, scale, clf_threshold, max_loop_size,
+            min_straightness=min_straightness,
+            large_root_length=large_root_length,
+            small_root_threshold=small_root_threshold,
+            collect_stats=collect_stats,
         )
         removed = roi_skel & ~filtered_skel
         roi_skel_diam[removed] = 0.0
@@ -1342,6 +1353,9 @@ class ROIExtractor:
         max_diameter_cv: float = DEFAULT_MAX_DIAMETER_CV,
         lateral_clf_threshold: float = DEFAULT_LATERAL_CLF_THRESHOLD,
         max_lateral_density: float = DEFAULT_MAX_LATERAL_DENSITY,
+        min_straightness: float = DEFAULT_MIN_STRAIGHTNESS,
+        large_root_length: int = DEFAULT_LARGE_ROOT_LENGTH,
+        small_root_threshold: float = DEFAULT_SMALL_ROOT_THRESHOLD,
     ) -> List[Dict]:
         """
         Slide a window across the interior crop and build one feature dict per ROI.
@@ -1386,6 +1400,9 @@ class ROIExtractor:
                 max_diameter_cv=max_diameter_cv,
                 lateral_clf_threshold=lateral_clf_threshold,
                 max_lateral_density=max_lateral_density,
+                min_straightness=min_straightness,
+                large_root_length=large_root_length,
+                small_root_threshold=small_root_threshold,
             )
 
         if n_workers > 1:
@@ -2842,6 +2859,35 @@ def _comp_loop_and_length(skeleton: np.ndarray, cy: int, cx: int) -> Tuple[bool,
     return (not bool((n_nbrs == 1).any())), comp_len
 
 
+def _skeleton_straightness(comp: np.ndarray) -> float:
+    """
+    Return end-to-end Euclidean distance / skeleton path length.
+
+    1.0 = perfectly straight; values near 0 = tightly curled fragment.
+    Returns 0.0 for loop components (no tip pixels) and single-pixel components.
+    """
+    ys, xs = np.where(comp)
+    if len(ys) < 2:
+        return 1.0
+    kern = np.ones((3, 3), dtype=np.float32)
+    kern[1, 1] = 0.0
+    comp_u8 = comp.astype(np.uint8)
+    n_nbrs  = cv2.filter2D(comp_u8, cv2.CV_32F, kern).astype(np.uint8) * comp_u8
+    tips    = np.argwhere(n_nbrs == 1)  # degree-1 pixels
+    if len(tips) < 2:
+        return 0.0  # closed loop — no tips
+    # Pick the most-distant tip pair for the end-to-end measurement
+    t0, t1 = tips[0], tips[-1]
+    if len(tips) > 2:
+        tip_f = tips.astype(np.float64)
+        D = cdist(tip_f, tip_f)
+        i, j = np.unravel_index(D.argmax(), D.shape)
+        t0, t1 = tips[i], tips[j]
+    end_to_end = float(np.linalg.norm(t0.astype(float) - t1.astype(float)))
+    path_len   = float(len(ys))
+    return float(min(end_to_end / path_len, 1.0))
+
+
 # ── Training augmentation transforms (module-level for picklability) ──────────
 
 def _aug_gray_hflip(g):   return g[:, ::-1].copy()
@@ -3310,35 +3356,34 @@ class SkeletonClassifier:
         scale: float,
         threshold: float = DEFAULT_CLASSIFIER_THRESHOLD,
         max_loop_size: int = DEFAULT_MAX_LOOP_SIZE,
-    ) -> np.ndarray:
+        min_straightness: float = DEFAULT_MIN_STRAIGHTNESS,
+        large_root_length: int = DEFAULT_LARGE_ROOT_LENGTH,
+        small_root_threshold: float = DEFAULT_SMALL_ROOT_THRESHOLD,
+        collect_stats: bool = False,
+    ) -> Tuple[np.ndarray, Optional[dict]]:
         """
-        Remove skeleton components whose P(root) < *threshold*.
+        Remove skeleton components that fail any of three sequential gates:
 
-        Two-pass decision per component:
-          1. Hard loop rule: if the component has no tip pixels AND its length ≤
-             max_loop_size, remove unconditionally (pore-ring heuristic).
-          2. RF rule: extract features at the component centroid and query the
-             Random Forest.  Remove if P(class=root) < threshold.
+          1. Hard loop rule — no-tip component ≤ max_loop_size → removed.
+          2. Straightness — end-to-end / path-length < min_straightness → removed.
+          3. Two-tier RF rule — short segments (< large_root_length) use
+             small_root_threshold; longer segments use threshold.
 
-        Parameters
-        ----------
-        skeleton : (H, W) bool — already min-seg-filtered skeleton (ROI patch)
-        gray : (H, W) uint8 — grayscale image patch (same spatial extent)
-        mask : (H, W) bool — binary root mask patch
-        threshold : float — P(root) below this → component removed
-        max_loop_size : int — hard loop cutoff in pixels
+        Returns
+        -------
+        filtered : (H, W) bool skeleton
+        stats : dict with per-stage counts (only populated when collect_stats=True)
         """
         if not self.is_loaded():
-            return skeleton
+            return skeleton, None
 
         conn8 = np.ones((3, 3), dtype=int)
         labeled, n = nd_label(skeleton, structure=conn8)
         if n == 0:
-            return skeleton
+            return skeleton, None
 
-        # Precompute DT and gradient once for this patch
-        dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        dt   = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+        gx   = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gy_g = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         grad = np.sqrt(gx ** 2 + gy_g ** 2)
 
@@ -3351,37 +3396,82 @@ class SkeletonClassifier:
 
         filtered = skeleton.copy()
 
-        for comp_id in range(1, n + 1):
-            comp = (labeled == comp_id)
-            comp_len = int(comp.sum())
+        n_loop = n_straight = n_rf_short = n_rf_long = 0
+        lens_before: List[int] = []
+        lens_after:  List[int] = []
+        scores_kept:    List[float] = []
+        scores_removed: List[float] = []
 
-            # ── Hard loop rule ────────────────────────────────────────────────
+        for comp_id in range(1, n + 1):
+            comp     = (labeled == comp_id)
+            comp_len = int(comp.sum())
+            if collect_stats:
+                lens_before.append(comp_len)
+
+            # ── 1. Hard loop rule ─────────────────────────────────────────────
             comp_u8 = comp.astype(np.uint8)
-            n_nbrs = (
+            n_nbrs  = (
                 cv2.filter2D(comp_u8, cv2.CV_32F, kern_nbr).astype(np.uint8)
                 * comp_u8
             )
             has_tip = bool((n_nbrs == 1).any())
             if not has_tip and comp_len <= max_loop_size:
                 filtered[comp] = False
+                n_loop += 1
                 continue
 
-            # ── RF rule ───────────────────────────────────────────────────────
+            # ── 2. Straightness gate ──────────────────────────────────────────
+            if min_straightness > 0:
+                s = _skeleton_straightness(comp)
+                if s < min_straightness:
+                    filtered[comp] = False
+                    n_straight += 1
+                    continue
+
+            # ── 3. Two-tier RF gate ───────────────────────────────────────────
             if root_idx is None:
+                if collect_stats:
+                    lens_after.append(comp_len)
                 continue
+
             ys, xs = np.where(comp)
             cy = int(np.clip(ys.mean(), 0, gray.shape[0] - 1))
             cx = int(np.clip(xs.mean(), 0, gray.shape[1] - 1))
-
             feats = _extract_features_at(
                 gray, skeleton, mask, cy, cx, scale,
                 _dt=dt, _grad=grad,
             )
-            proba = self.model.predict_proba([feats])[0]
-            if float(proba[root_idx]) < threshold:
-                filtered[comp] = False
+            p_root = float(self.model.predict_proba([feats])[0][root_idx])
 
-        return filtered
+            thr = threshold if comp_len >= large_root_length else small_root_threshold
+            if p_root < thr:
+                filtered[comp] = False
+                if comp_len >= large_root_length:
+                    n_rf_long += 1
+                else:
+                    n_rf_short += 1
+                if collect_stats:
+                    scores_removed.append(p_root)
+            else:
+                if collect_stats:
+                    lens_after.append(comp_len)
+                    scores_kept.append(p_root)
+
+        stats = None
+        if collect_stats:
+            stats = {
+                "n_total":       n,
+                "n_loop":        n_loop,
+                "n_straight":    n_straight,
+                "n_rf_short":    n_rf_short,
+                "n_rf_long":     n_rf_long,
+                "n_kept":        len(lens_after),
+                "lens_before":   lens_before,
+                "lens_after":    lens_after,
+                "scores_kept":   scores_kept,
+                "scores_removed": scores_removed,
+            }
+        return filtered, stats
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
 
@@ -3537,7 +3627,8 @@ def _process_image_worker(args: Tuple) -> Tuple[str, Tuple, np.ndarray, List[Dic
     ----------
     args : (path, scale, seg_kw, ext_kw, bins, min_prim_diam, n_roi_workers,
             debug_dir, classifier, clf_threshold, max_loop_size, lateral_kw,
-            pre_skeleton_threshold, min_component_area, remove_loops)
+            pre_skeleton_threshold, min_component_area, remove_loops,
+            min_straightness, large_root_length, small_root_threshold)
 
     Returns
     -------
@@ -3545,7 +3636,8 @@ def _process_image_worker(args: Tuple) -> Tuple[str, Tuple, np.ndarray, List[Dic
     """
     (path, scale, seg_kw, ext_kw, bins, min_prim_diam, n_roi_workers,
      debug_dir, classifier, clf_threshold, max_loop_size, lateral_kw,
-     pre_skeleton_threshold, min_component_area, remove_loops) = args
+     pre_skeleton_threshold, min_component_area, remove_loops,
+     min_straightness, large_root_length, small_root_threshold) = args
 
     rh   = RhizotronImage(path, scale)
     gray = rh.interior_gray
@@ -3631,9 +3723,46 @@ def _process_image_worker(args: Tuple) -> Tuple[str, Tuple, np.ndarray, List[Dic
                 flush=True,
             )
 
-    # ── Debug: save probability map and refined mask ──────────────────────────
+    # ── Debug: save probability map; print per-stage filter stats ────────────
     if debug_dir and prob_map is not None:
         _save_pre_skeleton_debug(prob_map, mask, mask, gray, debug_dir, rh.name)
+
+    if debug_dir and classifier is not None and classifier.is_loaded():
+        full_skel, _, _ = RootSegmenter.skeletonize_and_measure(mask, scale)
+        _, dbg_stats = classifier.filter_skeleton(
+            full_skel, gray, mask, scale,
+            clf_threshold, max_loop_size,
+            min_straightness=min_straightness,
+            large_root_length=large_root_length,
+            small_root_threshold=small_root_threshold,
+            collect_stats=True,
+        )
+        if dbg_stats and dbg_stats["n_total"] > 0:
+            lb  = dbg_stats["lens_before"]
+            la  = dbg_stats["lens_after"]
+            sk  = dbg_stats["scores_kept"]
+            sr  = dbg_stats["scores_removed"]
+            print(f"\n  [{rh.name}] skeleton filter stats:")
+            print(f"    Segments total:             {dbg_stats['n_total']}")
+            print(f"    Removed — loop heuristic:   {dbg_stats['n_loop']}")
+            print(f"    Removed — straightness:     {dbg_stats['n_straight']}")
+            print(f"    Removed — RF (short <{large_root_length}px): {dbg_stats['n_rf_short']}")
+            print(f"    Removed — RF (long ≥{large_root_length}px):  {dbg_stats['n_rf_long']}")
+            print(f"    Kept:                       {dbg_stats['n_kept']}")
+            if lb:
+                print(f"    Length before  — median {int(np.median(lb))} px  "
+                      f"mean {int(np.mean(lb))} px  "
+                      f"max {max(lb)} px")
+            if la:
+                print(f"    Length after   — median {int(np.median(la))} px  "
+                      f"mean {int(np.mean(la))} px  "
+                      f"max {max(la)} px")
+            if sk:
+                print(f"    P(root) kept   — mean {np.mean(sk):.3f}  "
+                      f"min {min(sk):.3f}")
+            if sr:
+                print(f"    P(root) removed— mean {np.mean(sr):.3f}  "
+                      f"max {max(sr):.3f}")
 
     extractor = ROIExtractor(**ext_kw)
     rois = extractor.extract_rois(
@@ -3643,6 +3772,9 @@ def _process_image_worker(args: Tuple) -> Tuple[str, Tuple, np.ndarray, List[Dic
         classifier=classifier,
         clf_threshold=clf_threshold,
         max_loop_size=max_loop_size,
+        min_straightness=min_straightness,
+        large_root_length=large_root_length,
+        small_root_threshold=small_root_threshold,
         **lateral_kw,
     )
 
@@ -3671,10 +3803,10 @@ class RhizotronPipeline:
         tophat_se_radius_mm: float = 2.5,
         min_primary_diameter_mm: float = 0.5,
         downsample: int = DEFAULT_DOWNSAMPLE,
-        min_segment_length_px: int = 30,
+        min_segment_length_px: int = 120,
         min_aspect_ratio: float = 3.0,
         max_root_diameter_mm: float = 3.0,
-        vesselness_threshold: float = 0.01,
+        vesselness_threshold: float = 0.05,
         min_skeleton_density: float = 0.02,
         border_margin: int = 100,
         n_jobs: int = DEFAULT_N_JOBS,
@@ -3695,6 +3827,9 @@ class RhizotronPipeline:
         pre_skeleton_threshold: float = DEFAULT_PRE_SKELETON_THRESHOLD,
         min_component_area: int = DEFAULT_MIN_COMPONENT_AREA,
         remove_loops: bool = False,
+        min_straightness: float = DEFAULT_MIN_STRAIGHTNESS,
+        large_root_length: int = DEFAULT_LARGE_ROOT_LENGTH,
+        small_root_threshold: float = DEFAULT_SMALL_ROOT_THRESHOLD,
     ):
         self.image_paths = image_paths
         self.output_dir = Path(output_dir)
@@ -3722,6 +3857,9 @@ class RhizotronPipeline:
         self.pre_skeleton_threshold = pre_skeleton_threshold
         self.min_component_area = min_component_area
         self.remove_loops = remove_loops
+        self.min_straightness = min_straightness
+        self.large_root_length = large_root_length
+        self.small_root_threshold = small_root_threshold
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3793,7 +3931,8 @@ class RhizotronPipeline:
             (path, self.scale, seg_kw, ext_kw, self.bins,
              self.min_primary_diam_mm, n_roi_workers, debug_dir,
              self.classifier, self.clf_threshold, self.max_loop_size, lateral_kw,
-             self.pre_skeleton_threshold, self.min_component_area, self.remove_loops)
+             self.pre_skeleton_threshold, self.min_component_area, self.remove_loops,
+             self.min_straightness, self.large_root_length, self.small_root_threshold)
             for path in self.image_paths
         ]
 
@@ -4287,6 +4426,38 @@ Parameter-tuning notes
     parser.set_defaults(remove_loops=False)
 
     parser.add_argument(
+        "--min-straightness", type=float,
+        default=DEFAULT_MIN_STRAIGHTNESS, metavar="RATIO",
+        dest="min_straightness",
+        help=(
+            "Minimum skeleton straightness (end-to-end distance / path length).  "
+            "1.0 = perfectly straight; values near 0 = tightly curled fragment.  "
+            "Segments below this threshold are removed before the RF gate.  "
+            f"Set to 0 to disable.  (default: {DEFAULT_MIN_STRAIGHTNESS})"
+        ),
+    )
+    parser.add_argument(
+        "--large-root-length", type=int,
+        default=DEFAULT_LARGE_ROOT_LENGTH, metavar="PX",
+        dest="large_root_length",
+        help=(
+            "Skeleton length threshold (px) for the two-tier RF gate.  "
+            "Segments ≥ this length use --classifier-threshold; shorter segments "
+            f"use --small-root-threshold.  (default: {DEFAULT_LARGE_ROOT_LENGTH})"
+        ),
+    )
+    parser.add_argument(
+        "--small-root-threshold", type=float,
+        default=DEFAULT_SMALL_ROOT_THRESHOLD, metavar="PROB",
+        dest="small_root_threshold",
+        help=(
+            "Stricter P(root) threshold applied to skeleton segments shorter than "
+            "--large-root-length.  Short segments are far more likely to be false "
+            f"positives.  (default: {DEFAULT_SMALL_ROOT_THRESHOLD})"
+        ),
+    )
+
+    parser.add_argument(
         "--conservative", action="store_true",
         help=(
             "Apply all precision-over-recall lateral parameters simultaneously: "
@@ -4525,6 +4696,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         pre_skeleton_threshold=args.pre_skeleton_threshold,
         min_component_area=args.min_component_area,
         remove_loops=args.remove_loops,
+        min_straightness=args.min_straightness,
+        large_root_length=args.large_root_length,
+        small_root_threshold=args.small_root_threshold,
     )
     pipeline.run()
 
