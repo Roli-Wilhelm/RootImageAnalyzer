@@ -2803,7 +2803,7 @@ def _skeleton_curvature(skel_patch: np.ndarray) -> float:
         # Fit along the longer axis to avoid vertical-line degeneracy.
         # RankWarning is expected for nearly-straight segments and is harmless.
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", np.exceptions.RankWarning)
+            warnings.simplefilter("ignore", np.RankWarning)
             if xs.std() >= ys.std():
                 a = np.polyfit(xs.astype(np.float64), ys.astype(np.float64), 2)[0]
             else:
