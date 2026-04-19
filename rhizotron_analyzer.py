@@ -70,7 +70,7 @@ DEFAULT_MIN_LATERAL_PERSISTENCE: int = 40 # px — must travel this far before r
 DEFAULT_MAX_DIAMETER_CV: float = 0.4      # coefficient of variation of diameter along lateral
 DEFAULT_LATERAL_CLF_THRESHOLD: float = 0.7  # stricter P(root) gate applied to laterals only
 DEFAULT_MAX_LATERAL_DENSITY: float = 2.0    # max laterals per cm of parent root length
-DEFAULT_PRE_SKELETON_THRESHOLD: float = 0.65  # classifier P(root) gate applied to mask components before skeletonization
+DEFAULT_PRE_SKELETON_THRESHOLD: float = 0.30  # classifier P(root) gate applied to mask components before skeletonization
 DEFAULT_MIN_COMPONENT_AREA: int = 500         # px² — mask components smaller than this removed before skeletonization
 # Memory estimate per image worker (for --n-jobs tuning):
 #   Full-res 4032×3024 image arrays  ≈  37 MB
@@ -676,16 +676,24 @@ def _apply_pre_skeleton_gate(
             refined[comp] = False
             continue
 
-        # Classifier gate
+        # Classifier gate — sample several interior points and take the max
+        # P(root) so one bad centroid doesn't condemn a whole root strand.
+        # (Skeleton features are unavailable here, so centroid-only scoring
+        # is systematically biased low for real roots.)
         if clf_active and root_idx is not None:
             ys, xs = np.where(comp)
-            cy     = int(np.clip(ys.mean(), 0, h - 1))
-            cx     = int(np.clip(xs.mean(), 0, w - 1))
-            feats  = _extract_features_at(
-                gray, empty_skel, mask, cy, cx, scale, _dt=dt, _grad=grad
-            )
-            proba  = classifier.model.predict_proba([feats])[0]
-            p_root = float(proba[root_idx])
+            n_pts  = min(5, len(ys))
+            idx    = np.linspace(0, len(ys) - 1, n_pts, dtype=int)
+            p_root = 0.0
+            for i in idx:
+                cy    = int(np.clip(ys[i], 0, h - 1))
+                cx    = int(np.clip(xs[i], 0, w - 1))
+                feats = _extract_features_at(
+                    gray, empty_skel, mask, cy, cx, scale, _dt=dt, _grad=grad
+                )
+                p     = float(classifier.model.predict_proba([feats])[0][root_idx])
+                if p > p_root:
+                    p_root = p
             prob_map[comp] = p_root
             if p_root < threshold:
                 refined[comp] = False
