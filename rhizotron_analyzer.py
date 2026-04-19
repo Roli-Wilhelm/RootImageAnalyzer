@@ -2800,11 +2800,14 @@ def _skeleton_curvature(skel_patch: np.ndarray) -> float:
     if len(xs) < 3:
         return 0.0
     try:
-        # Fit along the longer axis to avoid vertical-line degeneracy
-        if xs.std() >= ys.std():
-            a = np.polyfit(xs.astype(np.float64), ys.astype(np.float64), 2)[0]
-        else:
-            a = np.polyfit(ys.astype(np.float64), xs.astype(np.float64), 2)[0]
+        # Fit along the longer axis to avoid vertical-line degeneracy.
+        # RankWarning is expected for nearly-straight segments and is harmless.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", np.exceptions.RankWarning)
+            if xs.std() >= ys.std():
+                a = np.polyfit(xs.astype(np.float64), ys.astype(np.float64), 2)[0]
+            else:
+                a = np.polyfit(ys.astype(np.float64), xs.astype(np.float64), 2)[0]
         return float(min(abs(2.0 * a), 5.0))
     except (np.linalg.LinAlgError, ValueError):
         return 0.0
@@ -2829,6 +2832,88 @@ def _comp_loop_and_length(skeleton: np.ndarray, cy: int, cx: int) -> Tuple[bool,
     kern[1, 1] = 0.0
     n_nbrs = cv2.filter2D(comp_u8, cv2.CV_32F, kern).astype(np.uint8) * comp_u8
     return (not bool((n_nbrs == 1).any())), comp_len
+
+
+# ── Training augmentation transforms (module-level for picklability) ──────────
+
+def _aug_gray_hflip(g):   return g[:, ::-1].copy()
+def _aug_mask_hflip(m):   return m[:, ::-1].copy()
+def _aug_coord_hflip(y, x, H, W):  return (y, W - 1 - x)
+
+def _aug_gray_vflip(g):   return g[::-1, :].copy()
+def _aug_mask_vflip(m):   return m[::-1, :].copy()
+def _aug_coord_vflip(y, x, H, W):  return (H - 1 - y, x)
+
+def _aug_gray_rot90cw(g): return np.rot90(g, k=-1).copy()
+def _aug_mask_rot90cw(m): return np.rot90(m, k=-1).copy()
+def _aug_coord_rot90cw(y, x, H, W): return (x, H - 1 - y)
+
+def _aug_gray_blur(g):    return cv2.GaussianBlur(g, (0, 0), sigmaX=1.0)
+def _aug_mask_identity(m): return m
+def _aug_coord_identity(y, x, H, W): return (y, x)
+
+_AUG_TRANSFORMS = [
+    ("hflip",   _aug_gray_hflip,   _aug_mask_hflip,     _aug_coord_hflip),
+    ("vflip",   _aug_gray_vflip,   _aug_mask_vflip,     _aug_coord_vflip),
+    ("rot90cw", _aug_gray_rot90cw, _aug_mask_rot90cw,   _aug_coord_rot90cw),
+    ("blur",    _aug_gray_blur,    _aug_mask_identity,  _aug_coord_identity),
+]
+
+
+def _train_one_image(args: tuple):
+    """
+    Worker: segment one annotated image and return feature rows.
+    Returns (name, X float32, y int, w float32).
+    """
+    path, anns, scale, seg_kwargs, augment = args
+    name = Path(path).stem
+
+    rh = RhizotronImage(path, scale)
+    gray = rh.interior_gray
+    kw = dict(seg_kwargs, vesselness_threshold=0.0)
+    mask = RootSegmenter(**kw).segment(gray, scale)
+    skel, _, _ = RootSegmenter.skeletonize_and_measure(mask, scale)
+    dt   = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    gx   = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy_g = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx ** 2 + gy_g ** 2)
+
+    H, W = gray.shape
+    X_rows: List[np.ndarray] = []
+    y_rows: List[int] = []
+    w_rows: List[float] = []
+
+    def _collect(g, sk, mk, d, gr, ann_list, coord_fn=None):
+        fH, fW = g.shape
+        for ann in ann_list:
+            iy = int(ann["y"]); ix = int(ann["x"])
+            if coord_fn is not None:
+                iy, ix = coord_fn(iy, ix, fH, fW)
+            iy = int(np.clip(iy, 0, fH - 1))
+            ix = int(np.clip(ix, 0, fW - 1))
+            X_rows.append(_extract_features_at(g, sk, mk, iy, ix, scale, _dt=d, _grad=gr))
+            y_rows.append(int(ann["cls"]))
+            w_rows.append(1.0)
+
+    _collect(gray, skel, mask, dt, grad, anns)
+
+    if augment:
+        for _aug_name, gray_fn, mask_fn, coord_fn in _AUG_TRANSFORMS:
+            g_a  = gray_fn(gray)
+            m_a  = mask_fn(mask)
+            sk_a, _, _ = RootSegmenter.skeletonize_and_measure(m_a, scale)
+            dt_a = cv2.distanceTransform(m_a.astype(np.uint8), cv2.DIST_L2, 5)
+            gx_a = cv2.Sobel(g_a, cv2.CV_32F, 1, 0, ksize=3)
+            gy_a = cv2.Sobel(g_a, cv2.CV_32F, 0, 1, ksize=3)
+            grad_a = np.sqrt(gx_a ** 2 + gy_a ** 2)
+            _collect(g_a, sk_a, m_a, dt_a, grad_a, anns, coord_fn)
+
+    return (
+        name,
+        np.array(X_rows, dtype=np.float32),
+        np.array(y_rows, dtype=int),
+        np.array(w_rows, dtype=np.float32),
+    )
 
 
 def _extract_features_at(
@@ -3040,6 +3125,7 @@ class SkeletonClassifier:
         external_features: Optional[str] = None,
         source_weight: float = 1.0,
         augment: bool = True,
+        n_jobs: int = 1,
     ) -> None:
         """
         Build a feature matrix from annotated points and fit a Random Forest.
@@ -3106,70 +3192,28 @@ class SkeletonClassifier:
         y_list: List[int] = []
         w_list: List[float] = []  # per-sample weights for source weighting
 
-        # Augmentation transforms: (name, gray_fn, mask_fn, coord_fn(y, x, H, W))
-        _AUG_TRANSFORMS = [
-            ("hflip",
-             lambda g: g[:, ::-1].copy(),
-             lambda m: m[:, ::-1].copy(),
-             lambda y, x, H, W: (y, W - 1 - x)),
-            ("vflip",
-             lambda g: g[::-1, :].copy(),
-             lambda m: m[::-1, :].copy(),
-             lambda y, x, H, W: (H - 1 - y, x)),
-            ("rot90cw",
-             lambda g: np.rot90(g, k=-1).copy(),
-             lambda m: np.rot90(m, k=-1).copy(),
-             lambda y, x, H, W: (x, H - 1 - y)),
-            ("blur",
-             lambda g: cv2.GaussianBlur(g, (0, 0), sigmaX=1.0),
-             lambda m: m,
-             lambda y, x, H, W: (y, x)),
+        work = [
+            (path, name_to_anns[Path(path).stem], scale, seg_kwargs, augment)
+            for path in image_paths
+            if Path(path).stem in name_to_anns
         ]
 
-        for path in image_paths:
-            name = Path(path).stem
-            anns = name_to_anns.get(name)
-            if not anns:
-                continue
-
-            print(f"  [{name}]  {len(anns)} annotations — extracting features...")
-            rh = RhizotronImage(path, scale)
-            gray = rh.interior_gray
-            kw = dict(seg_kwargs, vesselness_threshold=0.0)
-            mask = RootSegmenter(**kw).segment(gray, scale)
-            skel, _, _ = RootSegmenter.skeletonize_and_measure(mask, scale)
-
-            # Precompute DT and gradient once per image
-            dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-            gy_g = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-            grad = np.sqrt(gx ** 2 + gy_g ** 2)
-
-            def _extract_anns(g, sk, mk, d, gr, anns_in, coord_fn=None):
-                H, W = g.shape
-                for ann in anns_in:
-                    iy = int(ann["y"]); ix = int(ann["x"])
-                    if coord_fn is not None:
-                        iy, ix = coord_fn(iy, ix, H, W)
-                    iy = int(np.clip(iy, 0, H - 1))
-                    ix = int(np.clip(ix, 0, W - 1))
-                    feats = _extract_features_at(g, sk, mk, iy, ix, scale, _dt=d, _grad=gr)
-                    X_list.append(feats)
-                    y_list.append(int(ann["cls"]))
-                    w_list.append(1.0)
-
-            _extract_anns(gray, skel, mask, dt, grad, anns)
-
-            if augment:
-                for _aug_name, gray_fn, mask_fn, coord_fn in _AUG_TRANSFORMS:
-                    g_a = gray_fn(gray)
-                    m_a = mask_fn(mask)
-                    sk_a, _, _ = RootSegmenter.skeletonize_and_measure(m_a, scale)
-                    dt_a = cv2.distanceTransform(m_a.astype(np.uint8), cv2.DIST_L2, 5)
-                    gx_a = cv2.Sobel(g_a, cv2.CV_32F, 1, 0, ksize=3)
-                    gy_a = cv2.Sobel(g_a, cv2.CV_32F, 0, 1, ksize=3)
-                    grad_a = np.sqrt(gx_a ** 2 + gy_a ** 2)
-                    _extract_anns(g_a, sk_a, m_a, dt_a, grad_a, anns, coord_fn)
+        print(f"  Extracting features from {len(work)} annotated image(s) "
+              f"using {n_jobs} worker(s)...")
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = {ex.submit(_train_one_image, w): w for w in work}
+            for fut in as_completed(futures):
+                try:
+                    name, X_img, y_img, w_img = fut.result()
+                except Exception as exc:
+                    path = futures[fut][0]
+                    print(f"  WARNING: failed on {Path(path).stem}: {exc}")
+                    continue
+                n_pts = len(y_img) // (1 + (4 if augment else 0))
+                print(f"  [{name}]  {n_pts} annotations → {len(y_img)} samples")
+                X_list.extend(X_img.tolist())
+                y_list.extend(y_img.tolist())
+                w_list.extend(w_img.tolist())
 
         own_n = len(X_list)
         if own_n < 10:
@@ -4430,6 +4474,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 external_features=args.external_features,
                 source_weight=args.source_weight,
                 augment=args.augment,
+                n_jobs=args.n_jobs,
             )
         except (ValueError, ImportError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
