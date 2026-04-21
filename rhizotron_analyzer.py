@@ -18,7 +18,7 @@ Usage:
 
 import argparse
 import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import json
 import os
 import sys

@@ -76,13 +76,20 @@ def _gabor_features(patch: np.ndarray) -> np.ndarray:
 
 
 def _skeleton_curvature(skel_patch: np.ndarray) -> float:
-    pts = np.argwhere(skel_patch)
-    if len(pts) < 3:
+    import warnings
+    ys, xs = np.where(skel_patch)
+    if len(xs) < 3:
         return 0.0
-    cov = np.cov(pts.T)
-    vals = np.linalg.eigvalsh(cov)
-    total = vals.sum()
-    return float(vals[0] / total) if total > 1e-8 else 0.0
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if xs.std() >= ys.std():
+                a = np.polyfit(xs.astype(np.float64), ys.astype(np.float64), 2)[0]
+            else:
+                a = np.polyfit(ys.astype(np.float64), xs.astype(np.float64), 2)[0]
+        return float(min(abs(2.0 * a), 5.0))
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.0
 
 
 def _comp_loop_and_length(skeleton: np.ndarray, cy: int, cx: int) -> Tuple[bool, int]:
