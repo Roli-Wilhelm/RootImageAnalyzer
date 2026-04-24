@@ -3878,15 +3878,20 @@ class PrimaryOnlyPipeline:
         enhanced = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, se)
 
         # Otsu threshold
-        _, binary = cv2.threshold(
+        otsu_val, binary = cv2.threshold(
             enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
 
         # Component filter: area + bounding-box aspect ratio
-        mask = self._filter_components(binary.astype(bool))
+        labeled_all  = sk_label(binary.astype(bool), connectivity=2)
+        n_before     = labeled_all.max()
+        mask         = self._filter_components(binary.astype(bool))
+        labeled_kept = sk_label(mask, connectivity=2)
+        n_after      = labeled_kept.max()
 
         # Skeletonise + diameter map
         skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(mask, self.scale)
+        n_skel_before = nd_label(skel, structure=np.ones((3,3),dtype=int))[1]
 
         # Stub pruning
         if self.prune_length > 0 and self.prune_passes > 0:
@@ -3896,10 +3901,32 @@ class PrimaryOnlyPipeline:
 
         # Minimum segment length
         skel = self._length_filter(skel, self.min_seg_len)
+        n_skel_after = nd_label(skel, structure=np.ones((3,3),dtype=int))[1]
+
+        # Per-stage debug report
+        print(f"  [{rh.name}]")
+        print(f"    top-hat Otsu threshold : {otsu_val:.0f}  "
+              f"(bright px after threshold: {int(binary.astype(bool).sum())} / "
+              f"{gray.size}  = {binary.astype(bool).mean()*100:.1f}%)")
+        print(f"    components before filter: {n_before}  "
+              f"after area+aspect filter: {n_after}  "
+              f"(min_area={self.min_area} px²  min_aspect={self.min_aspect})")
+        print(f"    skeleton segments before pruning+length: {n_skel_before}  "
+              f"after: {n_skel_after}  "
+              f"(min_seg={self.min_seg_len} px  prune={self.prune_length} px × {self.prune_passes})")
 
         rows = self._extract_segments(skel, skel_diam, rh.name)
         self._save_overlay(gray, skel, path)
-        print(f"  [{rh.name}]  {len(rows)} primary segment(s)")
+
+        # Also save intermediate debug images
+        dbg = self.vis_dir
+        cv2.imwrite(str(dbg / f"{rh.name}_1_tophat.png"), enhanced)
+        cv2.imwrite(str(dbg / f"{rh.name}_2_binary.png"), binary)
+        cv2.imwrite(str(dbg / f"{rh.name}_3_mask.png"),
+                    (mask * 255).astype(np.uint8))
+
+        print(f"    → {len(rows)} primary segment(s)  "
+              f"(debug images saved to {dbg}/)")
         return rows
 
     # ── Segmentation helpers ──────────────────────────────────────────────────
