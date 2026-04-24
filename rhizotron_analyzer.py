@@ -4016,8 +4016,11 @@ class PrimaryOnlyPipeline:
     # ── Visualisation ─────────────────────────────────────────────────────────
 
     def _save_overlay(self, gray: np.ndarray, skel: np.ndarray, path: str) -> None:
-        rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        rgb[skel] = (255, 255, 0)   # cyan in BGR
+        rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        # Dilate skeleton to 5px width so it's visible at any zoom level
+        thick = cv2.dilate(skel.astype(np.uint8),
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        rgb[thick.astype(bool)] = (255, 255, 0)   # cyan in BGR
         stem = Path(path).stem
         cv2.imwrite(str(self.vis_dir / f"{stem}_primary.png"), rgb)
 
