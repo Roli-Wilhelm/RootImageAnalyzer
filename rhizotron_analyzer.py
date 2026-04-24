@@ -43,6 +43,7 @@ from skimage.measure import label as sk_label, regionprops
 from skimage.morphology import (
     closing,
     disk,
+    erosion,
     remove_small_objects,
     skeletonize,
 )
@@ -3790,9 +3791,20 @@ class PrimaryOnlyPipeline:
     Stripped-down pipeline: large primary roots only, no classifier, no
     laterals, no ROI matching.
 
-    Steps per image:
-      top-hat enhancement → Otsu threshold → component filter (area + aspect)
-      → skeletonize → stub pruning → length filter → overlay PNG + CSV row.
+    Revised pipeline order per image:
+      0. Frame-margin crop (zero edges within frame_margin px)
+      1. Top-hat enhancement
+      2. Gaussian blur  (sigma=blur_sigma)
+      3. Intensity threshold  (keep top intensity_pct % of pixels)
+      4. Morphological closing  (disk radius close_radius)
+      5. Erosion  (disk radius erode_radius)
+      6. Component filter  (area ≥ min_area  AND  aspect ≥ min_aspect)
+      7. Skeletonize
+      8. Stub pruning  (prune_length × prune_passes)
+      9. Segment length filter  (≥ min_seg_len)
+
+    A debug PNG is saved after each numbered step so the failure point is
+    immediately visible.
 
     Complexity levels routed here:
       1 — primary roots only (length, coordinates)
@@ -3805,25 +3817,35 @@ class PrimaryOnlyPipeline:
         output_dir: str,
         scale_px_per_mm: float = DEFAULT_SCALE_PX_PER_MM,
         tophat_radius_mm: float = 2.5,
-        primary_min_area: int = 3000,
-        primary_min_aspect: float = 4.0,
+        frame_margin: int = 80,
+        blur_sigma: float = 1.5,
+        intensity_pct: float = 30.0,
+        close_radius: int = 4,
+        erode_radius: int = 3,
+        primary_min_area: int = 500,
+        primary_min_aspect: float = 2.0,
         min_segment_length: int = 200,
         prune_length: int = 100,
         prune_passes: int = 5,
         with_diameter: bool = False,
         n_jobs: int = 1,
     ):
-        self.image_paths    = image_paths
-        self.output_dir     = Path(output_dir)
-        self.scale          = scale_px_per_mm
-        self.tophat_radius  = tophat_radius_mm
-        self.min_area       = primary_min_area
-        self.min_aspect     = primary_min_aspect
-        self.min_seg_len    = min_segment_length
-        self.prune_length   = prune_length
-        self.prune_passes   = prune_passes
-        self.with_diameter  = with_diameter
-        self.n_jobs         = max(1, n_jobs)
+        self.image_paths   = image_paths
+        self.output_dir    = Path(output_dir)
+        self.scale         = scale_px_per_mm
+        self.tophat_radius = tophat_radius_mm
+        self.frame_margin  = frame_margin
+        self.blur_sigma    = blur_sigma
+        self.intensity_pct = intensity_pct
+        self.close_radius  = close_radius
+        self.erode_radius  = erode_radius
+        self.min_area      = primary_min_area
+        self.min_aspect    = primary_min_aspect
+        self.min_seg_len   = min_segment_length
+        self.prune_length  = prune_length
+        self.prune_passes  = prune_passes
+        self.with_diameter = with_diameter
+        self.n_jobs        = max(1, n_jobs)
 
         self.vis_dir = self.output_dir / "primary_only"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
@@ -3831,37 +3853,35 @@ class PrimaryOnlyPipeline:
     # ── Public entry point ────────────────────────────────────────────────────
 
     def run(self) -> None:
-        print(f"\n[Primary-only]  {len(self.image_paths)} image(s) — "
-              f"min area {self.min_area} px²  "
-              f"min aspect {self.min_aspect}  "
-              f"min segment {self.min_seg_len} px")
+        print(
+            f"\n[Primary-only]  {len(self.image_paths)} image(s)\n"
+            f"  frame_margin={self.frame_margin}px  "
+            f"blur_sigma={self.blur_sigma}  "
+            f"intensity_pct={self.intensity_pct}%\n"
+            f"  close_radius={self.close_radius}  "
+            f"erode_radius={self.erode_radius}  "
+            f"min_area={self.min_area}px²  "
+            f"min_aspect={self.min_aspect}\n"
+            f"  min_seg={self.min_seg_len}px  "
+            f"prune={self.prune_length}px×{self.prune_passes}"
+        )
 
         all_rows: List[Dict] = []
 
-        if self.n_jobs > 1:
-            with ProcessPoolExecutor(max_workers=min(self.n_jobs, len(self.image_paths))) as ex:
-                futures = {ex.submit(self._process_image, p): p for p in self.image_paths}
-                for fut in as_completed(futures):
-                    path = futures[fut]
-                    try:
-                        all_rows.extend(fut.result())
-                    except Exception as exc:
-                        print(f"  ERROR [{Path(path).stem}]: {exc}")
-        else:
-            for path in self.image_paths:
-                try:
-                    all_rows.extend(self._process_image(path))
-                except Exception as exc:
-                    print(f"  ERROR [{Path(path).stem}]: {exc}")
+        # Run serially so per-image diagnostics print in order
+        for path in self.image_paths:
+            try:
+                all_rows.extend(self._process_image(path))
+            except Exception as exc:
+                print(f"  ERROR [{Path(path).stem}]: {exc}")
 
         csv_path = self.output_dir / "primary_roots.csv"
         if all_rows:
             pd.DataFrame(all_rows).to_csv(csv_path, index=False)
             print(f"\n  {len(all_rows)} segment(s) across {len(self.image_paths)} image(s)")
-            print(f"  CSV  → {csv_path}")
+            print(f"  CSV     → {csv_path}")
         else:
-            print("\n  No primary root segments detected — try lowering "
-                  "--primary-min-area or --primary-min-aspect.")
+            print("\n  No primary root segments detected.")
         print(f"  Overlays → {self.vis_dir}/")
 
     # ── Per-image worker ──────────────────────────────────────────────────────
@@ -3869,88 +3889,134 @@ class PrimaryOnlyPipeline:
     def _process_image(self, path: str) -> List[Dict]:
         rh   = RhizotronImage(path, self.scale)
         gray = rh.interior_gray
+        name = rh.name
+        dbg  = self.vis_dir
 
-        # Top-hat for illumination normalisation
+        def _save(tag: str, img: np.ndarray) -> None:
+            """Save a single-channel or bool array as a greyscale debug PNG."""
+            if img.dtype == bool:
+                img = img.astype(np.uint8) * 255
+            cv2.imwrite(str(dbg / f"{name}_{tag}.png"), img)
+
+        print(f"\n  [{name}]  {gray.shape[1]}×{gray.shape[0]} px")
+
+        # ── Step 0: frame-margin crop ─────────────────────────────────────────
+        m = self.frame_margin
+        cropped = gray.copy()
+        if m > 0:
+            cropped[:m, :]  = 0
+            cropped[-m:, :] = 0
+            cropped[:, :m]  = 0
+            cropped[:, -m:] = 0
+        _save("s0_cropped", cropped)
+
+        # ── Step 1: top-hat ───────────────────────────────────────────────────
         r_px = max(1, int(round(self.tophat_radius * self.scale)))
         se   = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * r_px + 1, 2 * r_px + 1)
         )
-        enhanced = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, se)
+        tophat = cv2.morphologyEx(cropped, cv2.MORPH_TOPHAT, se)
+        _save("s1_tophat", tophat)
+        print(f"    s1 top-hat: SE radius={r_px}px  "
+              f"max={int(tophat.max())}  mean={tophat.mean():.1f}")
 
-        # Otsu threshold
-        otsu_val, binary = cv2.threshold(
-            enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
+        # ── Step 2: Gaussian blur ─────────────────────────────────────────────
+        k = max(3, 2 * int(3 * self.blur_sigma) + 1)   # odd kernel ≥ 3
+        blurred = cv2.GaussianBlur(tophat, (k, k), self.blur_sigma)
+        _save("s2_blurred", blurred)
 
-        # Component filter: area + bounding-box aspect ratio
-        labeled_all  = sk_label(binary.astype(bool), connectivity=2)
-        n_before     = labeled_all.max()
-        mask         = self._filter_components(binary.astype(bool))
-        labeled_kept = sk_label(mask, connectivity=2)
-        n_after      = labeled_kept.max()
+        # ── Step 3: intensity threshold (top N % of all pixels) ───────────────
+        thresh_val = float(np.percentile(blurred, 100.0 - self.intensity_pct))
+        binary = (blurred >= max(thresh_val, 1)).astype(np.uint8) * 255
+        bright_pct = binary.astype(bool).mean() * 100
+        _save("s3_binary", binary)
+        print(f"    s3 threshold: top {self.intensity_pct}% → "
+              f"cutoff={thresh_val:.1f}  bright={bright_pct:.1f}% of pixels")
 
-        # Skeletonise + diameter map
+        # ── Component size diagnostic (top 50 by area, before any filter) ─────
+        labeled_raw = sk_label(binary.astype(bool), connectivity=2)
+        props_raw   = sorted(regionprops(labeled_raw), key=lambda p: p.area, reverse=True)
+        print(f"    component diagnostic: {len(props_raw)} total components")
+        print(f"    {'rank':>4}  {'area':>8}  {'aspect':>6}  {'bbox_h':>7}  {'bbox_w':>7}")
+        for rank, p in enumerate(props_raw[:50], 1):
+            h = p.bbox[2] - p.bbox[0]; w = p.bbox[3] - p.bbox[1]
+            asp = max(h, w) / max(min(h, w), 1)
+            print(f"    {rank:>4}  {p.area:>8}  {asp:>6.1f}  {h:>7}  {w:>7}")
+
+        # ── Step 4: morphological closing ────────────────────────────────────
+        closed = closing(binary.astype(bool), disk(self.close_radius))
+        _save("s4_closed", closed)
+        print(f"    s4 closing radius={self.close_radius}: "
+              f"{closed.sum()} bright px  (was {binary.astype(bool).sum()})")
+
+        # ── Step 5: erosion ───────────────────────────────────────────────────
+        eroded = erosion(closed, disk(self.erode_radius))
+        _save("s5_eroded", eroded)
+        print(f"    s5 erosion  radius={self.erode_radius}: "
+              f"{eroded.sum()} bright px")
+
+        # ── Step 6: component filter (area + aspect) ──────────────────────────
+        mask, n_pass, n_fail_area, n_fail_asp = self._filter_components_verbose(eroded)
+        _save("s6_mask", mask)
+        print(f"    s6 component filter: {len(props_raw)} → "
+              f"{n_pass} pass  "
+              f"({n_fail_area} rejected by area<{self.min_area}  "
+              f"{n_fail_asp} by aspect<{self.min_aspect})")
+
+        # ── Step 7: skeletonize ───────────────────────────────────────────────
         skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(mask, self.scale)
-        n_skel_before = nd_label(skel, structure=np.ones((3,3),dtype=int))[1]
+        n_skel_raw = nd_label(skel, structure=np.ones((3, 3), dtype=int))[1]
+        _save("s7_skel_raw", skel)
+        print(f"    s7 skeleton: {n_skel_raw} components")
 
-        # Stub pruning
+        # ── Step 8: stub pruning ──────────────────────────────────────────────
         if self.prune_length > 0 and self.prune_passes > 0:
             pruned = prune_skeleton(skel, self.prune_length, self.prune_passes)
             skel_diam[skel & ~pruned] = 0.0
             skel = pruned
+        _save("s8_skel_pruned", skel)
 
-        # Minimum segment length
+        # ── Step 9: length filter ─────────────────────────────────────────────
         skel = self._length_filter(skel, self.min_seg_len)
-        n_skel_after = nd_label(skel, structure=np.ones((3,3),dtype=int))[1]
+        n_skel_final = nd_label(skel, structure=np.ones((3, 3), dtype=int))[1]
+        print(f"    s8-9 prune+length filter: {n_skel_raw} → "
+              f"{n_skel_final} segments  "
+              f"(prune={self.prune_length}px×{self.prune_passes}  "
+              f"min_len={self.min_seg_len}px)")
 
-        # Per-stage debug report
-        print(f"  [{rh.name}]")
-        print(f"    top-hat Otsu threshold : {otsu_val:.0f}  "
-              f"(bright px after threshold: {int(binary.astype(bool).sum())} / "
-              f"{gray.size}  = {binary.astype(bool).mean()*100:.1f}%)")
-        print(f"    components before filter: {n_before}  "
-              f"after area+aspect filter: {n_after}  "
-              f"(min_area={self.min_area} px²  min_aspect={self.min_aspect})")
-        print(f"    skeleton segments before pruning+length: {n_skel_before}  "
-              f"after: {n_skel_after}  "
-              f"(min_seg={self.min_seg_len} px  prune={self.prune_length} px × {self.prune_passes})")
-
-        rows = self._extract_segments(skel, skel_diam, rh.name)
+        rows = self._extract_segments(skel, skel_diam, name)
         self._save_overlay(gray, skel, path)
-
-        # Also save intermediate debug images
-        dbg = self.vis_dir
-        cv2.imwrite(str(dbg / f"{rh.name}_1_tophat.png"), enhanced)
-        cv2.imwrite(str(dbg / f"{rh.name}_2_binary.png"), binary)
-        cv2.imwrite(str(dbg / f"{rh.name}_3_mask.png"),
-                    (mask * 255).astype(np.uint8))
-
-        print(f"    → {len(rows)} primary segment(s)  "
-              f"(debug images saved to {dbg}/)")
+        print(f"    → {len(rows)} primary segment(s)")
         return rows
 
     # ── Segmentation helpers ──────────────────────────────────────────────────
 
-    def _filter_components(self, binary: np.ndarray) -> np.ndarray:
+    def _filter_components_verbose(
+        self, binary: np.ndarray
+    ) -> tuple:
+        """Filter by area + aspect; return (mask, n_pass, n_fail_area, n_fail_aspect)."""
         labeled = sk_label(binary, connectivity=2)
         out     = np.zeros_like(binary)
+        n_pass = n_fail_area = n_fail_asp = 0
         for p in regionprops(labeled):
             if p.area < self.min_area:
+                n_fail_area += 1
                 continue
-            h = p.bbox[2] - p.bbox[0]
-            w = p.bbox[3] - p.bbox[1]
+            h = p.bbox[2] - p.bbox[0]; w = p.bbox[3] - p.bbox[1]
             aspect = max(h, w) / max(min(h, w), 1)
             if aspect < self.min_aspect:
+                n_fail_asp += 1
                 continue
             out[labeled == p.label] = True
-        return out
+            n_pass += 1
+        return out, n_pass, n_fail_area, n_fail_asp
 
     def _length_filter(self, skel: np.ndarray, min_len: int) -> np.ndarray:
         if min_len <= 1 or not skel.any():
             return skel
-        conn8   = np.ones((3, 3), dtype=int)
+        conn8      = np.ones((3, 3), dtype=int)
         labeled, n = nd_label(skel, structure=conn8)
-        out = np.zeros_like(skel)
+        out        = np.zeros_like(skel)
         for cid in range(1, n + 1):
             comp = labeled == cid
             if comp.sum() >= min_len:
@@ -3960,31 +4026,24 @@ class PrimaryOnlyPipeline:
     # ── Measurement ──────────────────────────────────────────────────────────
 
     def _extract_segments(
-        self,
-        skel: np.ndarray,
-        skel_diam: np.ndarray,
-        name: str,
+        self, skel: np.ndarray, skel_diam: np.ndarray, name: str
     ) -> List[Dict]:
         if not skel.any():
             return []
-        conn8   = np.ones((3, 3), dtype=int)
+        conn8      = np.ones((3, 3), dtype=int)
         labeled, n = nd_label(skel, structure=conn8)
-        kern    = np.ones((3, 3), dtype=np.float32)
-        kern[1, 1] = 0.0
-        rows = []
+        kern       = np.ones((3, 3), dtype=np.float32); kern[1, 1] = 0.0
+        rows       = []
 
         for cid in range(1, n + 1):
-            comp     = labeled == cid
-            comp_len = int(comp.sum())
-            length_mm = comp_len / self.scale
-
-            # Find start/end as the most-distant tip pair
-            comp_u8 = comp.astype(np.uint8)
-            n_nbrs  = cv2.filter2D(comp_u8, cv2.CV_32F, kern).astype(np.uint8) * comp_u8
-            tips    = np.argwhere(n_nbrs == 1)
+            comp      = labeled == cid
+            comp_len  = int(comp.sum())
+            comp_u8   = comp.astype(np.uint8)
+            n_nbrs    = cv2.filter2D(comp_u8, cv2.CV_32F, kern).astype(np.uint8) * comp_u8
+            tips      = np.argwhere(n_nbrs == 1)
 
             if len(tips) >= 2:
-                D = cdist(tips.astype(np.float64), tips.astype(np.float64))
+                D    = cdist(tips.astype(np.float64), tips.astype(np.float64))
                 i, j = np.unravel_index(D.argmax(), D.shape)
                 sy, sx = int(tips[i][0]), int(tips[i][1])
                 ey, ex = int(tips[j][0]), int(tips[j][1])
@@ -3994,21 +4053,16 @@ class PrimaryOnlyPipeline:
                 ey, ex = int(ys[-1]), int(xs[-1])
 
             row: Dict = {
-                "image_name":  name,
-                "segment_id":  cid,
-                "length_mm":   round(length_mm, 2),
-                "start_y":     sy,
-                "start_x":     sx,
-                "end_y":       ey,
-                "end_x":       ex,
+                "image_name": name,
+                "segment_id": cid,
+                "length_mm":  round(comp_len / self.scale, 2),
+                "start_y": sy, "start_x": sx,
+                "end_y":   ey, "end_x":   ex,
             }
-
             if self.with_diameter:
-                d = skel_diam[comp]
-                d = d[d > 0]
+                d = skel_diam[comp]; d = d[d > 0]
                 row["mean_diameter_mm"] = round(float(d.mean()) if len(d) else 0.0, 3)
                 row["max_diameter_mm"]  = round(float(d.max())  if len(d) else 0.0, 3)
-
             rows.append(row)
 
         return rows
@@ -4016,13 +4070,11 @@ class PrimaryOnlyPipeline:
     # ── Visualisation ─────────────────────────────────────────────────────────
 
     def _save_overlay(self, gray: np.ndarray, skel: np.ndarray, path: str) -> None:
-        rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        # Dilate skeleton to 5px width so it's visible at any zoom level
+        rgb   = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         thick = cv2.dilate(skel.astype(np.uint8),
                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
         rgb[thick.astype(bool)] = (255, 255, 0)   # cyan in BGR
-        stem = Path(path).stem
-        cv2.imwrite(str(self.vis_dir / f"{stem}_primary.png"), rgb)
+        cv2.imwrite(str(self.vis_dir / f"{Path(path).stem}_primary.png"), rgb)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4724,21 +4776,66 @@ Parameter-tuning notes
         ),
     )
     parser.add_argument(
-        "--primary-min-area", type=int, default=3000, metavar="PX2",
+        "--primary-min-area", type=int, default=500, metavar="PX2",
         dest="primary_min_area",
         help=(
             "Minimum connected-component area (px²) in --primary-only / "
             "--complexity 1-2 mode.  Rejects small soil-texture blobs.  "
-            "(default: 3000)"
+            "(default: 500)"
         ),
     )
     parser.add_argument(
-        "--primary-min-aspect", type=float, default=4.0, metavar="RATIO",
+        "--primary-min-aspect", type=float, default=2.0, metavar="RATIO",
         dest="primary_min_aspect",
         help=(
             "Minimum bounding-box aspect ratio in --primary-only / "
             "--complexity 1-2 mode.  Rejects roughly round aggregates.  "
-            "(default: 4.0)"
+            "(default: 2.0)"
+        ),
+    )
+    parser.add_argument(
+        "--frame-margin", type=int, default=80, metavar="PX",
+        dest="frame_margin",
+        help=(
+            "Pixels to zero out near each image edge before processing in "
+            "--primary-only / --complexity 1-2 mode.  Excludes the scanner "
+            "frame border from detection.  (default: 80)"
+        ),
+    )
+    parser.add_argument(
+        "--blur-sigma", type=float, default=1.5, metavar="SIGMA",
+        dest="blur_sigma",
+        help=(
+            "Gaussian blur sigma applied after top-hat in --primary-only / "
+            "--complexity 1-2 mode.  Smooths noise before thresholding.  "
+            "(default: 1.5)"
+        ),
+    )
+    parser.add_argument(
+        "--primary-intensity-pct", type=float, default=30.0, metavar="PCT",
+        dest="primary_intensity_pct",
+        help=(
+            "Keep the top N%% of pixels by intensity in --primary-only / "
+            "--complexity 1-2 mode.  Higher values are more permissive.  "
+            "(default: 30.0)"
+        ),
+    )
+    parser.add_argument(
+        "--close-radius", type=int, default=4, metavar="PX",
+        dest="close_radius",
+        help=(
+            "Morphological closing disk radius (px) in --primary-only / "
+            "--complexity 1-2 mode.  Fills gaps in fuzzy root halos.  "
+            "(default: 4)"
+        ),
+    )
+    parser.add_argument(
+        "--erode-radius", type=int, default=3, metavar="PX",
+        dest="erode_radius",
+        help=(
+            "Erosion disk radius (px) applied after closing in --primary-only / "
+            "--complexity 1-2 mode.  Trims halo back to root body width.  "
+            "(default: 3)"
         ),
     )
 
@@ -4956,6 +5053,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             output_dir=args.output,
             scale_px_per_mm=args.scale,
             tophat_radius_mm=args.tophat_radius,
+            frame_margin=args.frame_margin,
+            blur_sigma=args.blur_sigma,
+            intensity_pct=args.primary_intensity_pct,
+            close_radius=args.close_radius,
+            erode_radius=args.erode_radius,
             primary_min_area=args.primary_min_area,
             primary_min_aspect=args.primary_min_aspect,
             min_segment_length=args.min_segment_length,
