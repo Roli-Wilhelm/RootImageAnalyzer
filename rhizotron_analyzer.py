@@ -3783,6 +3783,92 @@ def _process_image_worker(args: Tuple) -> Tuple[str, Tuple, np.ndarray, List[Dic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Ensemble worker (module-level so ProcessPoolExecutor can pickle it)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_primary_for_ensemble(args_tuple: tuple):
+    """
+    Single ensemble sweep worker.  Runs the primary pipeline with one
+    parameter set and returns (image_name, skeleton_bool_array).
+    Returns (name, None) on failure.
+    """
+    (path, scale, tophat_radius, frame_margin,
+     blur_sigma, tophat_percentile, close_radius,
+     prune_length, prune_passes, min_seg_len,
+     vis_dir_str, run_idx, save_individual) = args_tuple
+
+    try:
+        rh   = RhizotronImage(path, scale)
+        gray = rh.interior_gray
+        name = rh.name
+        ih, iw = gray.shape
+
+        # Step 0: hard frame crop
+        m = frame_margin
+        cropped = np.zeros_like(gray)
+        if m > 0 and 2 * m < ih and 2 * m < iw:
+            cropped[m:ih - m, m:iw - m] = gray[m:ih - m, m:iw - m]
+        else:
+            cropped = gray.copy()
+
+        # Step 1: top-hat
+        r_px = max(1, int(round(tophat_radius * scale)))
+        se   = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * r_px + 1, 2 * r_px + 1)
+        )
+        tophat_img = cv2.morphologyEx(cropped, cv2.MORPH_TOPHAT, se)
+
+        # Step 2: Gaussian blur
+        k       = max(3, 2 * int(3 * blur_sigma) + 1)
+        blurred = cv2.GaussianBlur(tophat_img, (k, k), blur_sigma)
+
+        # Step 3: percentile threshold on interior pixels
+        interior_vals = blurred[cropped > 0]
+        if interior_vals.size == 0:
+            interior_vals = blurred.ravel()
+        thresh_val = float(np.percentile(interior_vals, tophat_percentile))
+        binary = (blurred > max(thresh_val, 1)).astype(np.uint8) * 255
+        if m > 0:
+            binary[:m, :] = 0;  binary[ih - m:, :] = 0
+            binary[:, :m] = 0;  binary[:, iw - m:] = 0
+
+        # Step 4: morphological closing
+        to_skel = (closing(binary.astype(bool), disk(close_radius))
+                   if close_radius > 0 else binary.astype(bool))
+
+        # Step 5: skeletonize
+        skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(to_skel, scale)
+
+        # Step 6: stub pruning
+        if prune_length > 0 and prune_passes > 0:
+            pruned = prune_skeleton(skel, prune_length, prune_passes)
+            skel_diam[skel & ~pruned] = 0.0
+            skel = pruned
+
+        # Step 7: length filter
+        conn8         = np.ones((3, 3), dtype=int)
+        labeled_s, n_s = nd_label(skel, structure=conn8)
+        out = np.zeros_like(skel)
+        for cid in range(1, n_s + 1):
+            comp = labeled_s == cid
+            if comp.sum() >= min_seg_len:
+                out[comp] = True
+        skel = out
+
+        if save_individual and vis_dir_str:
+            cv2.imwrite(
+                str(Path(vis_dir_str) / f"{name}_run{run_idx:02d}_skel.png"),
+                skel.astype(np.uint8) * 255,
+            )
+
+        return (name, skel)
+
+    except Exception as exc:
+        print(f"  [ensemble worker] ERROR run {run_idx} {Path(path).stem}: {exc}")
+        return (Path(path).stem, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Primary-only pipeline  (--primary-only / --complexity 1-2)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4122,6 +4208,241 @@ class PrimaryOnlyPipeline:
                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
         rgb[thick.astype(bool)] = (255, 255, 0)   # cyan in BGR
         cv2.imwrite(str(self.vis_dir / f"{Path(path).stem}_primary.png"), rgb)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Ensemble pipeline  (--ensemble)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EnsemblePipeline:
+    """
+    Runs the primary-only pipeline N times with varied parameters and merges
+    the resulting skeletons via a pixel-level voting threshold.
+
+    Parameter sweep (each of the N runs gets a unique tophat_percentile value
+    drawn from linspace(75, 92, N); blur_sigma and close_radius cycle through
+    their discrete values):
+      tophat_percentile : linspace(75, 92, n_runs)
+      blur_sigma        : cycles {1.0, 1.5, 2.0}
+      close_radius      : cycles {1, 2, 3}
+
+    The combination list is shuffled with the given seed for variety in
+    execution order without changing which combinations are included.
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        output_dir: str,
+        scale_px_per_mm: float = DEFAULT_SCALE_PX_PER_MM,
+        tophat_radius_mm: float = 2.5,
+        frame_margin: int = 150,
+        n_runs: int = 10,
+        vote_threshold: float = 0.3,
+        seed: int = 42,
+        prune_length: int = 20,
+        prune_passes: int = 2,
+        min_segment_length: int = 100,
+        save_individual: bool = False,
+        n_jobs: int = 1,
+    ):
+        self.image_paths     = image_paths
+        self.output_dir      = Path(output_dir)
+        self.scale           = scale_px_per_mm
+        self.tophat_radius   = tophat_radius_mm
+        self.frame_margin    = frame_margin
+        self.n_runs          = n_runs
+        self.vote_threshold  = vote_threshold
+        self.seed            = seed
+        self.prune_length    = prune_length
+        self.prune_passes    = prune_passes
+        self.min_seg_len     = min_segment_length
+        self.save_individual = save_individual
+        self.n_jobs          = max(1, n_jobs)
+
+        self.vis_dir = self.output_dir / "ensemble"
+        self.vis_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Parameter generation ──────────────────────────────────────────────────
+
+    def _generate_param_sets(self) -> List[dict]:
+        """N parameter combos covering the sweep space evenly."""
+        rng         = np.random.default_rng(self.seed)
+        pct_vals    = np.linspace(75.0, 92.0, self.n_runs)
+        blur_cycle  = [1.0, 1.5, 2.0]
+        close_cycle = [1, 2, 3]
+
+        combos = []
+        for i, pct in enumerate(pct_vals):
+            combos.append({
+                "tophat_percentile": float(round(pct, 2)),
+                "blur_sigma":        blur_cycle[i % len(blur_cycle)],
+                "close_radius":      close_cycle[(i // len(blur_cycle)) % len(close_cycle)],
+            })
+
+        # Shuffle so execution order isn't systematically biased
+        order = rng.permutation(len(combos))
+        return [combos[i] for i in order]
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        param_sets = self._generate_param_sets()
+        print(
+            f"\n[Ensemble]  {len(self.image_paths)} image(s)  "
+            f"n_runs={self.n_runs}  vote_threshold={self.vote_threshold}  "
+            f"seed={self.seed}  n_jobs={self.n_jobs}\n"
+            f"  Parameter sweep:"
+        )
+        for i, p in enumerate(param_sets):
+            print(f"    run {i:02d}: tophat_pct={p['tophat_percentile']:.1f}  "
+                  f"blur={p['blur_sigma']}  close={p['close_radius']}")
+
+        all_rows: List[Dict] = []
+        for path in self.image_paths:
+            try:
+                all_rows.extend(self._process_image(path, param_sets))
+            except Exception as exc:
+                print(f"  ERROR [{Path(path).stem}]: {exc}")
+
+        csv_path = self.output_dir / "ensemble_roots.csv"
+        if all_rows:
+            pd.DataFrame(all_rows).to_csv(csv_path, index=False)
+            print(f"\n  {len(all_rows)} segment(s) across "
+                  f"{len(self.image_paths)} image(s)  →  {csv_path}")
+        else:
+            print("\n  No ensemble root segments detected.")
+        print(f"  Debug images → {self.vis_dir}/")
+
+    # ── Per-image ensemble ────────────────────────────────────────────────────
+
+    def _process_image(self, path: str, param_sets: List[dict]) -> List[Dict]:
+        rh   = RhizotronImage(path, self.scale)
+        gray = rh.interior_gray
+        name = rh.name
+        print(f"\n  [{name}]  {gray.shape[1]}×{gray.shape[0]} px  "
+              f"— running {self.n_runs} sweeps...")
+
+        worker_args = [
+            (
+                path, self.scale, self.tophat_radius, self.frame_margin,
+                p["blur_sigma"], p["tophat_percentile"], p["close_radius"],
+                self.prune_length, self.prune_passes, self.min_seg_len,
+                str(self.vis_dir), run_idx, self.save_individual,
+            )
+            for run_idx, p in enumerate(param_sets)
+        ]
+
+        # ── Run sweeps (parallel or serial) ──────────────────────────────────
+        skels: List[Optional[np.ndarray]] = [None] * self.n_runs
+
+        if self.n_jobs > 1:
+            with ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
+                futures = {
+                    pool.submit(_run_primary_for_ensemble, wa): run_idx
+                    for run_idx, wa in enumerate(worker_args)
+                }
+                for fut in as_completed(futures):
+                    run_idx = futures[fut]
+                    _, skel = fut.result()
+                    if skel is not None:
+                        skels[run_idx] = skel
+        else:
+            for run_idx, wa in enumerate(worker_args):
+                _, skel = _run_primary_for_ensemble(wa)
+                if skel is not None:
+                    skels[run_idx] = skel
+
+        # ── Accumulate votes ──────────────────────────────────────────────────
+        vote_map = np.zeros(gray.shape, dtype=np.float32)
+        n_valid  = 0
+        for skel in skels:
+            if skel is not None and skel.shape == gray.shape:
+                vote_map += skel.astype(np.float32)
+                n_valid  += 1
+
+        if n_valid == 0:
+            print(f"    All {self.n_runs} runs failed — skipping {name}")
+            return []
+
+        vote_map /= n_valid
+        n_above  = int((vote_map >= self.vote_threshold).sum())
+        print(f"    {n_valid}/{self.n_runs} runs completed  "
+              f"max_votes={vote_map.max():.2f}  "
+              f"pixels ≥ {self.vote_threshold}: {n_above}")
+
+        # Vote heatmap (HOT colormap: black→red→yellow→white)
+        votes_u8 = np.clip(vote_map * 255, 0, 255).astype(np.uint8)
+        heatmap  = cv2.applyColorMap(votes_u8, cv2.COLORMAP_HOT)
+        cv2.imwrite(str(self.vis_dir / f"{name}_ensemble_votes.png"), heatmap)
+
+        # ── Merge by voting threshold ─────────────────────────────────────────
+        merged_mask = vote_map >= self.vote_threshold
+
+        # Thin any thickened regions back to a single-pixel skeleton
+        skel_merged = skeletonize(merged_mask)
+
+        # Light stub cleanup: 1 pass, 20 px
+        skel_merged = prune_skeleton(skel_merged, 20, 1)
+
+        # Save merged binary skeleton
+        cv2.imwrite(
+            str(self.vis_dir / f"{name}_ensemble_skeleton.png"),
+            skel_merged.astype(np.uint8) * 255,
+        )
+
+        # Overlay on original image (cyan, 5 px wide)
+        rgb   = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        thick = cv2.dilate(
+            skel_merged.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        rgb[thick.astype(bool)] = (255, 255, 0)   # cyan in BGR
+        cv2.imwrite(str(self.vis_dir / f"{name}_ensemble_primary.png"), rgb)
+
+        n_final = nd_label(skel_merged, structure=np.ones((3, 3), dtype=int))[1]
+        print(f"    merged skeleton: {n_final} segment(s)")
+
+        rows = self._extract_segments(skel_merged, name)
+        print(f"    → {len(rows)} segment(s) in CSV")
+        return rows
+
+    # ── Segment extraction ────────────────────────────────────────────────────
+
+    def _extract_segments(self, skel: np.ndarray, name: str) -> List[Dict]:
+        if not skel.any():
+            return []
+        conn8      = np.ones((3, 3), dtype=int)
+        labeled, n = nd_label(skel, structure=conn8)
+        kern       = np.ones((3, 3), dtype=np.float32); kern[1, 1] = 0.0
+        rows: List[Dict] = []
+
+        for cid in range(1, n + 1):
+            comp     = labeled == cid
+            comp_len = int(comp.sum())
+            comp_u8  = comp.astype(np.uint8)
+            n_nbrs   = (cv2.filter2D(comp_u8, cv2.CV_32F, kern)
+                        .astype(np.uint8) * comp_u8)
+            tips     = np.argwhere(n_nbrs == 1)
+
+            if len(tips) >= 2:
+                D    = cdist(tips.astype(np.float64), tips.astype(np.float64))
+                i, j = np.unravel_index(D.argmax(), D.shape)
+                sy, sx = int(tips[i][0]), int(tips[i][1])
+                ey, ex = int(tips[j][0]), int(tips[j][1])
+            else:
+                ys, xs = np.where(comp)
+                sy, sx = int(ys[0]),  int(xs[0])
+                ey, ex = int(ys[-1]), int(xs[-1])
+
+            rows.append({
+                "image_name": name,
+                "segment_id": cid,
+                "length_mm":  round(comp_len / self.scale, 2),
+                "start_y": sy, "start_x": sx,
+                "end_y":   ey, "end_x":   ex,
+            })
+        return rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4890,6 +5211,46 @@ Parameter-tuning notes
         ),
     )
 
+    # ── Ensemble mode flags ───────────────────────────────────────────────────
+    parser.add_argument(
+        "--ensemble", action="store_true",
+        help=(
+            "Run the ensemble tracing mode: sweep parameters N times and merge "
+            "the resulting skeletons by pixel-level voting."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-runs", type=int, default=10, metavar="N", dest="ensemble_runs",
+        help=(
+            "Number of parameter-sweep runs in --ensemble mode.  Each run uses "
+            "a distinct tophat_percentile value; blur_sigma and close_radius "
+            "cycle over their discrete values.  (default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "--vote-threshold", type=float, default=0.3, metavar="FRAC",
+        dest="vote_threshold",
+        help=(
+            "Fraction of ensemble runs that must detect a skeleton pixel for it "
+            "to appear in the merged output.  0.3 = 30%%.  Higher = more "
+            "precise, may miss faint roots.  (default: 0.3)"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-seed", type=int, default=42, metavar="N", dest="ensemble_seed",
+        help=(
+            "Random seed controlling the shuffle of the parameter combinations "
+            "in --ensemble mode.  Same seed → same run order.  (default: 42)"
+        ),
+    )
+    parser.add_argument(
+        "--save-individual-runs", action="store_true", dest="save_individual_runs",
+        help=(
+            "Save each sweep run's skeleton as a separate PNG "
+            "({name}_run{N:02d}_skel.png) in the ensemble output directory."
+        ),
+    )
+
     parser.add_argument(
         "--conservative", action="store_true",
         help=(
@@ -5091,6 +5452,25 @@ def main(argv: Optional[List[str]] = None) -> None:
         except (ValueError, ImportError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
+        return
+
+    # ── Ensemble routing ─────────────────────────────────────────────────────
+    if args.ensemble:
+        EnsemblePipeline(
+            image_paths=image_paths,
+            output_dir=args.output,
+            scale_px_per_mm=args.scale,
+            tophat_radius_mm=args.tophat_radius,
+            frame_margin=args.frame_margin,
+            n_runs=args.ensemble_runs,
+            vote_threshold=args.vote_threshold,
+            seed=args.ensemble_seed,
+            prune_length=args.primary_prune_length,
+            prune_passes=args.primary_prune_passes,
+            min_segment_length=args.min_segment_length,
+            save_individual=args.save_individual_runs,
+            n_jobs=args.n_jobs,
+        ).run()
         return
 
     # ── Complexity / primary-only routing ────────────────────────────────────
