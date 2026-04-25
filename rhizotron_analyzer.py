@@ -3791,16 +3791,15 @@ class PrimaryOnlyPipeline:
     Stripped-down pipeline: large primary roots only, no classifier, no
     laterals, no ROI matching.
 
-    Revised pipeline order per image:
-      0. Frame detection  (Hough lines → inner ROI; fallback: frame_margin px crop)
+    Pipeline per image:
+      0. Hard frame crop  (zero pixels within frame_margin of each edge)
       1. Top-hat enhancement
       2. Gaussian blur  (sigma=blur_sigma)
-      3. Intensity threshold  (keep top intensity_pct % of pixels)
+      3. Percentile threshold on tophat interior pixels  (tophat_percentile)
       4. Morphological closing  (disk radius close_radius; skipped if skip_morphology)
-      5. Component filter  (area ≥ min_area  AND  aspect ≥ min_aspect)
-      6. Skeletonize
-      7. Stub pruning  (prune_length × prune_passes; skipped if no_prune)
-      8. Segment length filter  (≥ min_seg_len)
+      5. Skeletonize directly — no component shape filter
+      6. Stub pruning  (prune_length × prune_passes; skipped if no_prune)
+      7. Segment length filter  (≥ min_seg_len)
 
     A debug PNG is saved after each numbered step so the failure point is
     immediately visible.
@@ -3816,13 +3815,11 @@ class PrimaryOnlyPipeline:
         output_dir: str,
         scale_px_per_mm: float = DEFAULT_SCALE_PX_PER_MM,
         tophat_radius_mm: float = 2.5,
-        frame_margin: int = 80,
+        frame_margin: int = 150,
         blur_sigma: float = 1.5,
-        intensity_pct: float = 30.0,
+        tophat_percentile: float = 85.0,
         close_radius: int = 2,
-        primary_min_area: int = 200,
-        primary_min_aspect: float = 1.5,
-        min_segment_length: int = 200,
+        min_segment_length: int = 100,
         prune_length: int = 20,
         prune_passes: int = 2,
         skip_morphology: bool = False,
@@ -3830,23 +3827,21 @@ class PrimaryOnlyPipeline:
         with_diameter: bool = False,
         n_jobs: int = 1,
     ):
-        self.image_paths     = image_paths
-        self.output_dir      = Path(output_dir)
-        self.scale           = scale_px_per_mm
-        self.tophat_radius   = tophat_radius_mm
-        self.frame_margin    = frame_margin
-        self.blur_sigma      = blur_sigma
-        self.intensity_pct   = intensity_pct
-        self.close_radius    = close_radius
-        self.min_area        = primary_min_area
-        self.min_aspect      = primary_min_aspect
-        self.min_seg_len     = min_segment_length
-        self.prune_length    = prune_length
-        self.prune_passes    = prune_passes
-        self.skip_morphology = skip_morphology
-        self.no_prune        = no_prune
-        self.with_diameter   = with_diameter
-        self.n_jobs          = max(1, n_jobs)
+        self.image_paths      = image_paths
+        self.output_dir       = Path(output_dir)
+        self.scale            = scale_px_per_mm
+        self.tophat_radius    = tophat_radius_mm
+        self.frame_margin     = frame_margin
+        self.blur_sigma       = blur_sigma
+        self.tophat_percentile = tophat_percentile
+        self.close_radius     = close_radius
+        self.min_seg_len      = min_segment_length
+        self.prune_length     = prune_length
+        self.prune_passes     = prune_passes
+        self.skip_morphology  = skip_morphology
+        self.no_prune         = no_prune
+        self.with_diameter    = with_diameter
+        self.n_jobs           = max(1, n_jobs)
 
         self.vis_dir = self.output_dir / "primary_only"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
@@ -3858,14 +3853,12 @@ class PrimaryOnlyPipeline:
             f"\n[Primary-only]  {len(self.image_paths)} image(s)\n"
             f"  frame_margin={self.frame_margin}px  "
             f"blur_sigma={self.blur_sigma}  "
-            f"intensity_pct={self.intensity_pct}%\n"
+            f"tophat_percentile={self.tophat_percentile}\n"
             f"  close_radius={self.close_radius}  "
             f"skip_morphology={self.skip_morphology}  "
-            f"min_area={self.min_area}px²  "
-            f"min_aspect={self.min_aspect}\n"
+            f"no_prune={self.no_prune}\n"
             f"  min_seg={self.min_seg_len}px  "
-            f"prune={self.prune_length}px×{self.prune_passes}  "
-            f"no_prune={self.no_prune}"
+            f"prune={self.prune_length}px×{self.prune_passes}"
         )
 
         all_rows: List[Dict] = []
@@ -3893,18 +3886,24 @@ class PrimaryOnlyPipeline:
         gray = rh.interior_gray
         name = rh.name
         dbg  = self.vis_dir
+        ih, iw = gray.shape
 
         def _save(tag: str, img: np.ndarray) -> None:
             out = img.astype(np.uint8) * 255 if img.dtype == bool else img
             cv2.imwrite(str(dbg / f"{name}_{tag}.png"), out)
 
-        print(f"\n  [{name}]  {gray.shape[1]}×{gray.shape[0]} px")
+        print(f"\n  [{name}]  {iw}×{ih} px")
 
-        # ── Step 0: frame detection ───────────────────────────────────────────
-        top, bot, left, right = self._detect_frame_roi(gray, _save)
+        # ── Step 0: hard frame crop ───────────────────────────────────────────
+        m = self.frame_margin
         cropped = np.zeros_like(gray)
-        cropped[top:bot, left:right] = gray[top:bot, left:right]
+        if m > 0 and 2 * m < ih and 2 * m < iw:
+            cropped[m:ih - m, m:iw - m] = gray[m:ih - m, m:iw - m]
+        else:
+            cropped = gray.copy()
         _save("s0_cropped", cropped)
+        print(f"    s0 frame crop: margin={m}px  "
+              f"interior={max(0, iw - 2*m)}×{max(0, ih - 2*m)} px")
 
         # ── Step 1: top-hat ───────────────────────────────────────────────────
         r_px = max(1, int(round(self.tophat_radius * self.scale)))
@@ -3914,59 +3913,52 @@ class PrimaryOnlyPipeline:
         tophat = cv2.morphologyEx(cropped, cv2.MORPH_TOPHAT, se)
         _save("s1_tophat", tophat)
         print(f"    s1 top-hat: SE radius={r_px}px  "
-              f"max={int(tophat.max())}  mean={tophat.mean():.1f}")
+              f"max={int(tophat.max())}  mean={tophat.mean():.2f}")
 
         # ── Step 2: Gaussian blur ─────────────────────────────────────────────
         k = max(3, 2 * int(3 * self.blur_sigma) + 1)
         blurred = cv2.GaussianBlur(tophat, (k, k), self.blur_sigma)
         _save("s2_blurred", blurred)
 
-        # ── Step 3: intensity threshold (top N % of all pixels) ───────────────
-        thresh_val = float(np.percentile(blurred, 100.0 - self.intensity_pct))
-        binary = (blurred >= max(thresh_val, 1)).astype(np.uint8) * 255
+        # ── Step 3: percentile threshold on interior tophat pixels ───────────
+        interior_vals = blurred[cropped > 0]
+        if interior_vals.size == 0:
+            interior_vals = blurred.ravel()
+        thresh_val = float(np.percentile(interior_vals, self.tophat_percentile))
+        binary = (blurred > max(thresh_val, 1)).astype(np.uint8) * 255
+        # Re-enforce frame crop on the binary (belt-and-suspenders)
+        if m > 0:
+            binary[:m, :] = 0;  binary[ih - m:, :] = 0
+            binary[:, :m] = 0;  binary[:, iw - m:] = 0
         bright_pct = binary.astype(bool).mean() * 100
         _save("s3_binary", binary)
-        print(f"    s3 threshold: top {self.intensity_pct}% → "
-              f"cutoff={thresh_val:.1f}  bright={bright_pct:.1f}% of pixels")
-
-        # ── Component size diagnostic (top 50 by area, before any filter) ─────
-        labeled_raw = sk_label(binary.astype(bool), connectivity=2)
-        props_raw   = sorted(regionprops(labeled_raw), key=lambda p: p.area, reverse=True)
-        print(f"    component diagnostic: {len(props_raw)} total components")
-        print(f"    {'rank':>4}  {'area':>8}  {'aspect':>6}  {'bbox_h':>7}  {'bbox_w':>7}")
-        for rank, p in enumerate(props_raw[:50], 1):
-            ph = p.bbox[2] - p.bbox[0]; pw = p.bbox[3] - p.bbox[1]
-            asp = max(ph, pw) / max(min(ph, pw), 1)
-            print(f"    {rank:>4}  {p.area:>8}  {asp:>6.1f}  {ph:>7}  {pw:>7}")
+        print(f"    s3 tophat {self.tophat_percentile}th-pct threshold: "
+              f"cutoff={thresh_val:.1f}  bright={bright_pct:.1f}% of all px")
 
         # ── Step 4: morphological closing (gated by --skip-morphology) ────────
-        if self.skip_morphology:
-            to_filter = binary.astype(bool)
-            print(f"    s4 closing skipped (--skip-morphology)")
+        if self.skip_morphology or self.close_radius <= 0:
+            to_skel = binary.astype(bool)
+            _save("s4_closed", to_skel)
+            print(f"    s4 closing skipped")
         else:
-            closed = closing(binary.astype(bool), disk(self.close_radius))
-            _save("s4_closed", closed)
+            to_skel = closing(binary.astype(bool), disk(self.close_radius))
+            _save("s4_closed", to_skel)
             print(f"    s4 closing radius={self.close_radius}: "
-                  f"{closed.sum()} bright px  (was {binary.astype(bool).sum()})")
-            to_filter = closed
+                  f"{to_skel.sum()} px  (was {binary.astype(bool).sum()})")
 
-        # ── Step 5: component filter (area + aspect) ──────────────────────────
-        mask, n_pass, n_fail_area, n_fail_asp = self._filter_components_verbose(to_filter)
-        _save("s5_mask", mask)
-        print(f"    s5 component filter: {len(props_raw)} components → "
-              f"{n_pass} pass  "
-              f"({n_fail_area} rejected by area<{self.min_area}  "
-              f"{n_fail_asp} by aspect<{self.min_aspect})")
+        # Save s5_mask as the mask fed into skeletonization (for comparison)
+        _save("s5_mask", to_skel)
 
-        # ── Step 6: skeletonize ───────────────────────────────────────────────
-        skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(mask, self.scale)
+        # ── Step 5: skeletonize ───────────────────────────────────────────────
+        skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(to_skel, self.scale)
         n_skel_raw = nd_label(skel, structure=np.ones((3, 3), dtype=int))[1]
         _save("s6_skel_raw", skel)
-        print(f"    s6 skeleton: {n_skel_raw} components")
+        print(f"    s5 skeleton: {n_skel_raw} components  "
+              f"({int(skel.sum())} px)")
 
-        # ── Step 7: stub pruning ──────────────────────────────────────────────
+        # ── Step 6: stub pruning ──────────────────────────────────────────────
         if self.no_prune or self.prune_length <= 0 or self.prune_passes <= 0:
-            print(f"    s7 pruning skipped "
+            print(f"    s6 pruning skipped "
                   f"({'--no-prune' if self.no_prune else 'prune_length=0'})")
         else:
             pruned = prune_skeleton(skel, self.prune_length, self.prune_passes)
@@ -3974,10 +3966,10 @@ class PrimaryOnlyPipeline:
             skel = pruned
         _save("s7_skel_pruned", skel)
 
-        # ── Step 8: length filter ─────────────────────────────────────────────
+        # ── Step 7: length filter ─────────────────────────────────────────────
         skel = self._length_filter(skel, self.min_seg_len)
         n_skel_final = nd_label(skel, structure=np.ones((3, 3), dtype=int))[1]
-        print(f"    s7-8 prune+length: {n_skel_raw} → {n_skel_final} segments  "
+        print(f"    s6-7 prune+length: {n_skel_raw} → {n_skel_final} segments  "
               f"(prune={self.prune_length}px×{self.prune_passes}  "
               f"min_len={self.min_seg_len}px)")
 
@@ -4831,29 +4823,11 @@ Parameter-tuning notes
         ),
     )
     parser.add_argument(
-        "--primary-min-area", type=int, default=200, metavar="PX2",
-        dest="primary_min_area",
-        help=(
-            "Minimum connected-component area (px²) in --primary-only / "
-            "--complexity 1-2 mode.  Rejects small soil-texture blobs.  "
-            "(default: 200)"
-        ),
-    )
-    parser.add_argument(
-        "--primary-min-aspect", type=float, default=1.5, metavar="RATIO",
-        dest="primary_min_aspect",
-        help=(
-            "Minimum bounding-box aspect ratio in --primary-only / "
-            "--complexity 1-2 mode.  Rejects roughly round aggregates.  "
-            "(default: 1.5)"
-        ),
-    )
-    parser.add_argument(
-        "--frame-margin", type=int, default=80, metavar="PX",
+        "--frame-margin", type=int, default=150, metavar="PX",
         dest="frame_margin",
         help=(
-            "Fallback fixed-pixel crop when Hough frame detection fails in "
-            "--primary-only / --complexity 1-2 mode.  (default: 80)"
+            "Pixels cropped from each edge in --primary-only / --complexity 1-2 "
+            "mode to exclude the scanner frame border.  (default: 150)"
         ),
     )
     parser.add_argument(
@@ -4861,17 +4835,17 @@ Parameter-tuning notes
         dest="blur_sigma",
         help=(
             "Gaussian blur sigma applied after top-hat in --primary-only / "
-            "--complexity 1-2 mode.  Smooths noise before thresholding.  "
-            "(default: 1.5)"
+            "--complexity 1-2 mode.  (default: 1.5)"
         ),
     )
     parser.add_argument(
-        "--primary-intensity-pct", type=float, default=30.0, metavar="PCT",
-        dest="primary_intensity_pct",
+        "--tophat-percentile", type=float, default=85.0, metavar="PCT",
+        dest="tophat_percentile",
         help=(
-            "Keep the top N%% of pixels by intensity in --primary-only / "
-            "--complexity 1-2 mode.  Higher values are more permissive.  "
-            "(default: 30.0)"
+            "Percentile of interior tophat pixel values used as the threshold "
+            "in --primary-only / --complexity 1-2 mode.  Pixels above the "
+            "Nth percentile are classified as root.  Lower = more permissive.  "
+            "(default: 85.0)"
         ),
     )
     parser.add_argument(
@@ -4879,7 +4853,7 @@ Parameter-tuning notes
         dest="close_radius",
         help=(
             "Morphological closing disk radius (px) in --primary-only / "
-            "--complexity 1-2 mode.  Fills gaps between root fragments.  "
+            "--complexity 1-2 mode.  Fills small gaps in root strands.  "
             "(default: 2)"
         ),
     )
@@ -5132,10 +5106,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             tophat_radius_mm=args.tophat_radius,
             frame_margin=args.frame_margin,
             blur_sigma=args.blur_sigma,
-            intensity_pct=args.primary_intensity_pct,
+            tophat_percentile=args.tophat_percentile,
             close_radius=args.close_radius,
-            primary_min_area=args.primary_min_area,
-            primary_min_aspect=args.primary_min_aspect,
             min_segment_length=args.min_segment_length,
             prune_length=args.primary_prune_length,
             prune_passes=args.primary_prune_passes,
