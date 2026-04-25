@@ -4322,7 +4322,8 @@ class EnsemblePipeline:
         tophat_radius_mm: float = 2.5,
         frame_margin: int = 150,
         n_runs: int = 10,
-        n_fine_runs: int = 15,
+        n_fine_runs: int = 0,
+        fine_roots: bool = False,
         vote_threshold_a: float = 0.3,
         vote_threshold_b: float = 0.4,
         fine_root_weight: float = 0.7,
@@ -4340,6 +4341,7 @@ class EnsemblePipeline:
         self.frame_margin     = frame_margin
         self.n_runs           = n_runs
         self.n_fine_runs      = n_fine_runs
+        self.fine_roots       = fine_roots
         self.vote_threshold_a = vote_threshold_a
         self.vote_threshold_b = vote_threshold_b
         self.fine_root_weight = fine_root_weight
@@ -4392,22 +4394,28 @@ class EnsemblePipeline:
 
     def run(self) -> None:
         param_sets_a = self._generate_param_sets()
-        param_sets_b = self._generate_fine_param_sets()
+        param_sets_b = self._generate_fine_param_sets() if self.fine_roots else []
+
+        b_status = (
+            f"ON (--fine-roots)  {len(param_sets_b)} runs  "
+            f"thr_B={self.vote_threshold_b}  weight={self.fine_root_weight}"
+            if self.fine_roots else "OFF"
+        )
         print(
             f"\n[Ensemble]  {len(self.image_paths)} image(s)  "
             f"n_jobs={self.n_jobs}  seed={self.seed}\n"
-            f"  Channel A: {self.n_runs} runs  thr_A={self.vote_threshold_a}\n"
-            f"  Channel B: {len(param_sets_b)} runs  thr_B={self.vote_threshold_b}  "
-            f"weight={self.fine_root_weight}"
+            f"  Channel A (large roots): {self.n_runs} runs  thr_A={self.vote_threshold_a}\n"
+            f"  Channel B (fine roots):  {b_status}"
         )
         print("  Channel A sweep:")
         for i, p in enumerate(param_sets_a):
             print(f"    A{i:02d}: pct={p['tophat_percentile']:.1f}  "
                   f"blur={p['blur_sigma']}  close={p['close_radius']}")
-        print("  Channel B sweep:")
-        for i, p in enumerate(param_sets_b):
-            print(f"    B{i:02d}: ft_r={p['fine_tophat_radius']}  "
-                  f"blk={p['adaptive_block']}  fs_max={p['frangi_scale_max']}")
+        if self.fine_roots:
+            print("  Channel B sweep:")
+            for i, p in enumerate(param_sets_b):
+                print(f"    B{i:02d}: ft_r={p['fine_tophat_radius']}  "
+                      f"blk={p['adaptive_block']}  fs_max={p['frangi_scale_max']}")
 
         all_rows: List[Dict] = []
         for path in self.image_paths:
@@ -5405,12 +5413,20 @@ Parameter-tuning notes
         ),
     )
     parser.add_argument(
-        "--fine-ensemble-runs", type=int, default=15, metavar="N",
+        "--fine-roots", action="store_true", dest="fine_roots",
+        help=(
+            "Enable Channel B (fine-root detection) in --ensemble mode.  "
+            "Without this flag Channel B does not run.  Channel B uses "
+            "small-kernel tophat + adaptive threshold + Frangi vesselness."
+        ),
+    )
+    parser.add_argument(
+        "--fine-ensemble-runs", type=int, default=0, metavar="N",
         dest="fine_ensemble_runs",
         help=(
-            "Number of Channel B (fine-root) sweeps in --ensemble mode.  "
+            "Number of Channel B sweeps when --fine-roots is active.  "
             "Parameter grid is 3×3×3=27 combos; this limits how many are used.  "
-            "(default: 15)"
+            "(default: 0; set to 15 when enabling --fine-roots)"
         ),
     )
     parser.add_argument(
@@ -5644,7 +5660,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             tophat_radius_mm=args.tophat_radius,
             frame_margin=args.frame_margin,
             n_runs=args.ensemble_runs,
-            n_fine_runs=args.fine_ensemble_runs,
+            n_fine_runs=args.fine_ensemble_runs if args.fine_ensemble_runs > 0 else 15,
+            fine_roots=args.fine_roots,
             vote_threshold_a=args.vote_threshold,
             vote_threshold_b=args.vote_threshold_b,
             fine_root_weight=args.fine_root_weight,
