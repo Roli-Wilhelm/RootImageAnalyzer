@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import binary_fill_holes, label as nd_label
 from scipy.spatial.distance import cdist
-from skimage.filters import frangi
+from skimage.filters import frangi, threshold_local
 from skimage.measure import label as sk_label, regionprops
 from skimage.morphology import (
     closing,
@@ -3868,6 +3868,94 @@ def _run_primary_for_ensemble(args_tuple: tuple):
         return (Path(path).stem, None)
 
 
+def _run_fine_for_ensemble(args_tuple: tuple):
+    """
+    Channel B worker: fine-root detection pass using small-kernel tophat,
+    adaptive thresholding, and Frangi vesselness filtering.
+    Returns (image_name, skeleton_bool_array) or (name, None) on failure.
+    """
+    (path, scale, _tophat_radius_mm, frame_margin,
+     fine_tophat_radius, adaptive_block, frangi_scale_max,
+     prune_length, prune_passes, min_seg_len,
+     vis_dir_str, run_idx, save_individual) = args_tuple
+
+    try:
+        rh   = RhizotronImage(path, scale)
+        gray = rh.interior_gray
+        name = rh.name
+        ih, iw = gray.shape
+
+        # Step 0: hard frame crop
+        m = frame_margin
+        cropped = np.zeros_like(gray)
+        if m > 0 and 2 * m < ih and 2 * m < iw:
+            cropped[m:ih - m, m:iw - m] = gray[m:ih - m, m:iw - m]
+        else:
+            cropped = gray.copy()
+        interior = cropped > 0
+
+        # Step 1: small-kernel top-hat for fine-root contrast
+        r_px     = max(1, int(fine_tophat_radius))
+        se       = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * r_px + 1, 2 * r_px + 1)
+        )
+        tophat_f_u8 = cv2.morphologyEx(cropped, cv2.MORPH_TOPHAT, se)
+
+        # Step 2: adaptive threshold (handles spatially varying contrast)
+        tophat_f = tophat_f_u8.astype(np.float64) / max(float(tophat_f_u8.max()), 1.0)
+        blk      = adaptive_block if adaptive_block % 2 == 1 else adaptive_block + 1
+        loc_thr  = threshold_local(tophat_f, block_size=blk, method="gaussian")
+        binary_a = ((tophat_f > loc_thr) & interior).astype(np.uint8) * 255
+        # Re-enforce frame crop
+        if m > 0:
+            binary_a[:m, :] = 0;  binary_a[ih - m:, :] = 0
+            binary_a[:, :m] = 0;  binary_a[:, iw - m:] = 0
+
+        # Step 3: Frangi vesselness — suppress soil aggregates, keep strands
+        sigmas     = list(np.linspace(0.5, max(float(frangi_scale_max), 0.6), 3))
+        vessel_map = frangi(tophat_f, sigmas=sigmas, black_ridges=False)
+        adapt_bool = binary_a.astype(bool)
+        if adapt_bool.any():
+            v_thr = float(np.percentile(vessel_map[adapt_bool], 50))
+        else:
+            v_thr = float(vessel_map.max() * 0.1)
+        strand_mask = adapt_bool & (vessel_map > v_thr)
+
+        # Step 4: closing (tight, radius 1)
+        to_skel = closing(strand_mask, disk(1)) if strand_mask.any() else strand_mask
+
+        # Step 5: skeletonize
+        skel, skel_diam, _ = RootSegmenter.skeletonize_and_measure(to_skel, scale)
+
+        # Step 6: more aggressive pruning (fine roots generate shorter false stubs)
+        if prune_length > 0 and prune_passes > 0:
+            pruned = prune_skeleton(skel, prune_length, prune_passes)
+            skel_diam[skel & ~pruned] = 0.0
+            skel = pruned
+
+        # Step 7: length filter
+        conn8          = np.ones((3, 3), dtype=int)
+        labeled_s, n_s = nd_label(skel, structure=conn8)
+        out = np.zeros_like(skel)
+        for cid in range(1, n_s + 1):
+            comp = labeled_s == cid
+            if comp.sum() >= min_seg_len:
+                out[comp] = True
+        skel = out
+
+        if save_individual and vis_dir_str:
+            cv2.imwrite(
+                str(Path(vis_dir_str) / f"{name}_finerun{run_idx:02d}_skel.png"),
+                skel.astype(np.uint8) * 255,
+            )
+
+        return (name, skel)
+
+    except Exception as exc:
+        print(f"  [fine-root worker] ERROR run {run_idx} {Path(path).stem}: {exc}")
+        return (Path(path).stem, None)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Primary-only pipeline  (--primary-only / --complexity 1-2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4216,18 +4304,14 @@ class PrimaryOnlyPipeline:
 
 class EnsemblePipeline:
     """
-    Runs the primary-only pipeline N times with varied parameters and merges
-    the resulting skeletons via a pixel-level voting threshold.
+    Two-channel ensemble:
+      Channel A (large roots) — tophat + percentile threshold, N runs.
+      Channel B (fine roots)  — small-kernel tophat + adaptive threshold +
+                                Frangi vesselness, M runs.
 
-    Parameter sweep (each of the N runs gets a unique tophat_percentile value
-    drawn from linspace(75, 92, N); blur_sigma and close_radius cycle through
-    their discrete values):
-      tophat_percentile : linspace(75, 92, n_runs)
-      blur_sigma        : cycles {1.0, 1.5, 2.0}
-      close_radius      : cycles {1, 2, 3}
-
-    The combination list is shuffled with the given seed for variety in
-    execution order without changing which combinations are included.
+    Both channels accumulate pixel votes independently.  Final skeleton is the
+    union of pixels that pass their per-channel vote threshold plus any pixel
+    with at least one vote from both channels (cross-channel agreement).
     """
 
     def __init__(
@@ -4238,7 +4322,10 @@ class EnsemblePipeline:
         tophat_radius_mm: float = 2.5,
         frame_margin: int = 150,
         n_runs: int = 10,
-        vote_threshold: float = 0.3,
+        n_fine_runs: int = 15,
+        vote_threshold_a: float = 0.3,
+        vote_threshold_b: float = 0.4,
+        fine_root_weight: float = 0.7,
         seed: int = 42,
         prune_length: int = 20,
         prune_passes: int = 2,
@@ -4246,19 +4333,22 @@ class EnsemblePipeline:
         save_individual: bool = False,
         n_jobs: int = 1,
     ):
-        self.image_paths     = image_paths
-        self.output_dir      = Path(output_dir)
-        self.scale           = scale_px_per_mm
-        self.tophat_radius   = tophat_radius_mm
-        self.frame_margin    = frame_margin
-        self.n_runs          = n_runs
-        self.vote_threshold  = vote_threshold
-        self.seed            = seed
-        self.prune_length    = prune_length
-        self.prune_passes    = prune_passes
-        self.min_seg_len     = min_segment_length
-        self.save_individual = save_individual
-        self.n_jobs          = max(1, n_jobs)
+        self.image_paths      = image_paths
+        self.output_dir       = Path(output_dir)
+        self.scale            = scale_px_per_mm
+        self.tophat_radius    = tophat_radius_mm
+        self.frame_margin     = frame_margin
+        self.n_runs           = n_runs
+        self.n_fine_runs      = n_fine_runs
+        self.vote_threshold_a = vote_threshold_a
+        self.vote_threshold_b = vote_threshold_b
+        self.fine_root_weight = fine_root_weight
+        self.seed             = seed
+        self.prune_length     = prune_length
+        self.prune_passes     = prune_passes
+        self.min_seg_len      = min_segment_length
+        self.save_individual  = save_individual
+        self.n_jobs           = max(1, n_jobs)
 
         self.vis_dir = self.output_dir / "ensemble"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
@@ -4266,42 +4356,63 @@ class EnsemblePipeline:
     # ── Parameter generation ──────────────────────────────────────────────────
 
     def _generate_param_sets(self) -> List[dict]:
-        """N parameter combos covering the sweep space evenly."""
+        """Channel A: N combos — tophat_percentile × blur_sigma × close_radius."""
         rng         = np.random.default_rng(self.seed)
         pct_vals    = np.linspace(75.0, 92.0, self.n_runs)
         blur_cycle  = [1.0, 1.5, 2.0]
         close_cycle = [1, 2, 3]
-
-        combos = []
-        for i, pct in enumerate(pct_vals):
-            combos.append({
+        combos = [
+            {
                 "tophat_percentile": float(round(pct, 2)),
                 "blur_sigma":        blur_cycle[i % len(blur_cycle)],
                 "close_radius":      close_cycle[(i // len(blur_cycle)) % len(close_cycle)],
-            })
-
-        # Shuffle so execution order isn't systematically biased
+            }
+            for i, pct in enumerate(pct_vals)
+        ]
         order = rng.permutation(len(combos))
         return [combos[i] for i in order]
+
+    def _generate_fine_param_sets(self) -> List[dict]:
+        """Channel B: up to n_fine_runs combos — fine_tophat × adaptive_block × frangi_scale."""
+        rng          = np.random.default_rng(self.seed + 1)
+        tophat_opts  = [5, 8, 12]
+        block_opts   = [31, 51, 71]
+        scale_opts   = [1.0, 1.5, 2.0]
+        all_combos   = [
+            {"fine_tophat_radius": ft, "adaptive_block": ab, "frangi_scale_max": fs}
+            for ft in tophat_opts
+            for ab in block_opts
+            for fs in scale_opts
+        ]  # 27 combinations
+        n = min(self.n_fine_runs, len(all_combos))
+        order = rng.permutation(len(all_combos))[:n]
+        return [all_combos[i] for i in order]
 
     # ── Public entry point ────────────────────────────────────────────────────
 
     def run(self) -> None:
-        param_sets = self._generate_param_sets()
+        param_sets_a = self._generate_param_sets()
+        param_sets_b = self._generate_fine_param_sets()
         print(
             f"\n[Ensemble]  {len(self.image_paths)} image(s)  "
-            f"n_runs={self.n_runs}  vote_threshold={self.vote_threshold}  "
-            f"seed={self.seed}  n_jobs={self.n_jobs}\n"
-            f"  Parameter sweep:"
+            f"n_jobs={self.n_jobs}  seed={self.seed}\n"
+            f"  Channel A: {self.n_runs} runs  thr_A={self.vote_threshold_a}\n"
+            f"  Channel B: {len(param_sets_b)} runs  thr_B={self.vote_threshold_b}  "
+            f"weight={self.fine_root_weight}"
         )
-        for i, p in enumerate(param_sets):
-            print(f"    run {i:02d}: tophat_pct={p['tophat_percentile']:.1f}  "
+        print("  Channel A sweep:")
+        for i, p in enumerate(param_sets_a):
+            print(f"    A{i:02d}: pct={p['tophat_percentile']:.1f}  "
                   f"blur={p['blur_sigma']}  close={p['close_radius']}")
+        print("  Channel B sweep:")
+        for i, p in enumerate(param_sets_b):
+            print(f"    B{i:02d}: ft_r={p['fine_tophat_radius']}  "
+                  f"blk={p['adaptive_block']}  fs_max={p['frangi_scale_max']}")
 
         all_rows: List[Dict] = []
         for path in self.image_paths:
             try:
-                all_rows.extend(self._process_image(path, param_sets))
+                all_rows.extend(self._process_image(path, param_sets_a, param_sets_b))
             except Exception as exc:
                 print(f"  ERROR [{Path(path).stem}]: {exc}")
 
@@ -4316,96 +4427,139 @@ class EnsemblePipeline:
 
     # ── Per-image ensemble ────────────────────────────────────────────────────
 
-    def _process_image(self, path: str, param_sets: List[dict]) -> List[Dict]:
+    def _process_image(
+        self,
+        path: str,
+        param_sets_a: List[dict],
+        param_sets_b: List[dict],
+    ) -> List[Dict]:
         rh   = RhizotronImage(path, self.scale)
         gray = rh.interior_gray
         name = rh.name
+        n_b  = len(param_sets_b)
         print(f"\n  [{name}]  {gray.shape[1]}×{gray.shape[0]} px  "
-              f"— running {self.n_runs} sweeps...")
+              f"— A:{self.n_runs} sweeps  B:{n_b} sweeps")
 
-        worker_args = [
-            (
-                path, self.scale, self.tophat_radius, self.frame_margin,
-                p["blur_sigma"], p["tophat_percentile"], p["close_radius"],
-                self.prune_length, self.prune_passes, self.min_seg_len,
-                str(self.vis_dir), run_idx, self.save_individual,
-            )
-            for run_idx, p in enumerate(param_sets)
+        # Build worker arg tuples
+        args_a = [
+            (path, self.scale, self.tophat_radius, self.frame_margin,
+             p["blur_sigma"], p["tophat_percentile"], p["close_radius"],
+             self.prune_length, self.prune_passes, self.min_seg_len,
+             str(self.vis_dir), i, self.save_individual)
+            for i, p in enumerate(param_sets_a)
+        ]
+        args_b = [
+            (path, self.scale, self.tophat_radius, self.frame_margin,
+             p["fine_tophat_radius"], p["adaptive_block"], p["frangi_scale_max"],
+             30, 3, self.min_seg_len,        # fine roots: prune 30px × 3 passes
+             str(self.vis_dir), i, self.save_individual)
+            for i, p in enumerate(param_sets_b)
         ]
 
-        # ── Run sweeps (parallel or serial) ──────────────────────────────────
-        skels: List[Optional[np.ndarray]] = [None] * self.n_runs
+        skels_a: List[Optional[np.ndarray]] = [None] * self.n_runs
+        skels_b: List[Optional[np.ndarray]] = [None] * n_b
 
         if self.n_jobs > 1:
             with ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
-                futures = {
-                    pool.submit(_run_primary_for_ensemble, wa): run_idx
-                    for run_idx, wa in enumerate(worker_args)
-                }
-                for fut in as_completed(futures):
-                    run_idx = futures[fut]
+                tag: Dict = {}
+                for i, wa in enumerate(args_a):
+                    tag[pool.submit(_run_primary_for_ensemble, wa)] = ("A", i)
+                for i, wb in enumerate(args_b):
+                    tag[pool.submit(_run_fine_for_ensemble, wb)] = ("B", i)
+                for fut in as_completed(list(tag)):
+                    ch, idx = tag[fut]
                     _, skel = fut.result()
                     if skel is not None:
-                        skels[run_idx] = skel
+                        (skels_a if ch == "A" else skels_b)[idx] = skel
         else:
-            for run_idx, wa in enumerate(worker_args):
+            for i, wa in enumerate(args_a):
                 _, skel = _run_primary_for_ensemble(wa)
-                if skel is not None:
-                    skels[run_idx] = skel
+                if skel is not None: skels_a[i] = skel
+            for i, wb in enumerate(args_b):
+                _, skel = _run_fine_for_ensemble(wb)
+                if skel is not None: skels_b[i] = skel
 
-        # ── Accumulate votes ──────────────────────────────────────────────────
-        vote_map = np.zeros(gray.shape, dtype=np.float32)
-        n_valid  = 0
-        for skel in skels:
-            if skel is not None and skel.shape == gray.shape:
-                vote_map += skel.astype(np.float32)
-                n_valid  += 1
+        # ── Accumulate per-channel vote maps ──────────────────────────────────
+        def _accumulate(skels, n_total):
+            vm      = np.zeros(gray.shape, dtype=np.float32)
+            n_valid = 0
+            for sk in skels:
+                if sk is not None and sk.shape == gray.shape:
+                    vm += sk.astype(np.float32);  n_valid += 1
+            if n_valid:
+                vm /= n_valid
+            return vm, n_valid
 
-        if n_valid == 0:
-            print(f"    All {self.n_runs} runs failed — skipping {name}")
+        vote_a, n_a = _accumulate(skels_a, self.n_runs)
+        vote_b, n_b_valid = _accumulate(skels_b, n_b)
+
+        if n_a == 0 and n_b_valid == 0:
+            print(f"    All runs failed — skipping {name}")
             return []
 
-        vote_map /= n_valid
-        n_above  = int((vote_map >= self.vote_threshold).sum())
-        print(f"    {n_valid}/{self.n_runs} runs completed  "
-              f"max_votes={vote_map.max():.2f}  "
-              f"pixels ≥ {self.vote_threshold}: {n_above}")
+        # Print stats
+        print(f"    A: {n_a}/{self.n_runs} valid  "
+              f"max={vote_a.max():.2f}  "
+              f"px≥{self.vote_threshold_a}: {int((vote_a >= self.vote_threshold_a).sum())}")
+        print(f"    B: {n_b_valid}/{n_b} valid  "
+              f"max={vote_b.max():.2f}  "
+              f"px≥{self.vote_threshold_b}: {int((vote_b >= self.vote_threshold_b).sum())}")
 
-        # Vote heatmap (HOT colormap: black→red→yellow→white)
-        votes_u8 = np.clip(vote_map * 255, 0, 255).astype(np.uint8)
-        heatmap  = cv2.applyColorMap(votes_u8, cv2.COLORMAP_HOT)
-        cv2.imwrite(str(self.vis_dir / f"{name}_ensemble_votes.png"), heatmap)
+        # Save per-channel and combined heatmaps
+        self._save_heatmap(vote_a, self.vis_dir / f"{name}_votes_A.png")
+        self._save_heatmap(vote_b, self.vis_dir / f"{name}_votes_B.png")
+        combined_norm = (vote_a + vote_b * self.fine_root_weight) / (1.0 + self.fine_root_weight)
+        self._save_heatmap(combined_norm, self.vis_dir / f"{name}_votes_combined.png")
 
-        # ── Merge by voting threshold ─────────────────────────────────────────
-        merged_mask = vote_map >= self.vote_threshold
+        # ── Merge: per-channel thresholds + cross-channel agreement ───────────
+        mask_a      = vote_a >= self.vote_threshold_a
+        mask_b      = vote_b >= self.vote_threshold_b
+        both_agree  = (vote_a > 0) & (vote_b > 0)   # any vote from each channel
+        merged_mask = mask_a | mask_b | both_agree
 
-        # Thin any thickened regions back to a single-pixel skeleton
+        # Thin + light cleanup
         skel_merged = skeletonize(merged_mask)
-
-        # Light stub cleanup: 1 pass, 20 px
         skel_merged = prune_skeleton(skel_merged, 20, 1)
 
-        # Save merged binary skeleton
+        # Channel attribution on the final skeleton
+        px_a_only  = int((skel_merged & mask_a & ~both_agree & ~mask_b).sum())
+        px_b_only  = int((skel_merged & mask_b & ~both_agree & ~mask_a).sum())
+        px_both    = int((skel_merged & both_agree).sum())
+        print(f"    Skeleton px — A-only:{px_a_only}  B-only:{px_b_only}  "
+              f"cross-channel:{px_both}  total:{int(skel_merged.sum())}")
+
+        # Save merged binary
         cv2.imwrite(
             str(self.vis_dir / f"{name}_ensemble_skeleton.png"),
             skel_merged.astype(np.uint8) * 255,
         )
 
-        # Overlay on original image (cyan, 5 px wide)
-        rgb   = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        thick = cv2.dilate(
-            skel_merged.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-        )
-        rgb[thick.astype(bool)] = (255, 255, 0)   # cyan in BGR
-        cv2.imwrite(str(self.vis_dir / f"{name}_ensemble_primary.png"), rgb)
+        # Color-coded overlay: A=cyan, B=yellow, cross-channel=green
+        rgb     = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        dil_se  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-        n_final = nd_label(skel_merged, structure=np.ones((3, 3), dtype=int))[1]
-        print(f"    merged skeleton: {n_final} segment(s)")
+        def _paint(mask, color):
+            m = skel_merged & mask
+            if m.any():
+                rgb[cv2.dilate(m.astype(np.uint8), dil_se).astype(bool)] = color
 
-        rows = self._extract_segments(skel_merged, name)
-        print(f"    → {len(rows)} segment(s) in CSV")
+        _paint(mask_a & ~both_agree & ~mask_b, (255, 255, 0))   # cyan  — A only
+        _paint(mask_b & ~both_agree & ~mask_a, (0,   255, 255))  # yellow — B only
+        _paint(both_agree,                      (0,   255, 0))    # green  — both
+
+        cv2.imwrite(str(self.vis_dir / f"{name}_final_primary.png"), rgb)
+
+        n_segs = nd_label(skel_merged, structure=np.ones((3, 3), dtype=int))[1]
+        rows   = self._extract_segments(skel_merged, name)
+        print(f"    → {n_segs} components  {len(rows)} segment(s)")
         return rows
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _save_heatmap(vote_map: np.ndarray, path) -> None:
+        u8 = np.clip(vote_map * 255, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(path), cv2.applyColorMap(u8, cv2.COLORMAP_HOT))
 
     # ── Segment extraction ────────────────────────────────────────────────────
 
@@ -5250,6 +5404,33 @@ Parameter-tuning notes
             "({name}_run{N:02d}_skel.png) in the ensemble output directory."
         ),
     )
+    parser.add_argument(
+        "--fine-ensemble-runs", type=int, default=15, metavar="N",
+        dest="fine_ensemble_runs",
+        help=(
+            "Number of Channel B (fine-root) sweeps in --ensemble mode.  "
+            "Parameter grid is 3×3×3=27 combos; this limits how many are used.  "
+            "(default: 15)"
+        ),
+    )
+    parser.add_argument(
+        "--vote-threshold-b", type=float, default=0.4, metavar="FRAC",
+        dest="vote_threshold_b",
+        help=(
+            "Vote threshold for Channel B (fine roots) in --ensemble mode.  "
+            "Slightly stricter than --vote-threshold since fine-root detection "
+            "is noisier.  (default: 0.4)"
+        ),
+    )
+    parser.add_argument(
+        "--fine-root-weight", type=float, default=0.7, metavar="W",
+        dest="fine_root_weight",
+        help=(
+            "Relative weight of Channel B votes in the combined heatmap display.  "
+            "Does not affect thresholding, only the _votes_combined.png output.  "
+            "(default: 0.7)"
+        ),
+    )
 
     parser.add_argument(
         "--conservative", action="store_true",
@@ -5463,7 +5644,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             tophat_radius_mm=args.tophat_radius,
             frame_margin=args.frame_margin,
             n_runs=args.ensemble_runs,
-            vote_threshold=args.vote_threshold,
+            n_fine_runs=args.fine_ensemble_runs,
+            vote_threshold_a=args.vote_threshold,
+            vote_threshold_b=args.vote_threshold_b,
+            fine_root_weight=args.fine_root_weight,
             seed=args.ensemble_seed,
             prune_length=args.primary_prune_length,
             prune_passes=args.primary_prune_passes,
