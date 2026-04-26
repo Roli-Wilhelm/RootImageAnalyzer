@@ -4509,32 +4509,40 @@ class EnsemblePipeline:
         print(f"    A: {n_a}/{self.n_runs} valid  "
               f"max={vote_a.max():.2f}  "
               f"px≥{self.vote_threshold_a}: {int((vote_a >= self.vote_threshold_a).sum())}")
-        print(f"    B: {n_b_valid}/{n_b} valid  "
-              f"max={vote_b.max():.2f}  "
-              f"px≥{self.vote_threshold_b}: {int((vote_b >= self.vote_threshold_b).sum())}")
+        if self.fine_roots:
+            print(f"    B: {n_b_valid}/{n_b} valid  "
+                  f"max={vote_b.max():.2f}  "
+                  f"px≥{self.vote_threshold_b}: {int((vote_b >= self.vote_threshold_b).sum())}")
 
-        # Save per-channel and combined heatmaps
+        # Save per-channel heatmaps; B and combined only when fine_roots is active
         self._save_heatmap(vote_a, self.vis_dir / f"{name}_votes_A.png")
-        self._save_heatmap(vote_b, self.vis_dir / f"{name}_votes_B.png")
-        combined_norm = (vote_a + vote_b * self.fine_root_weight) / (1.0 + self.fine_root_weight)
-        self._save_heatmap(combined_norm, self.vis_dir / f"{name}_votes_combined.png")
+        if self.fine_roots:
+            self._save_heatmap(vote_b, self.vis_dir / f"{name}_votes_B.png")
+            combined_norm = (vote_a + vote_b * self.fine_root_weight) / (1.0 + self.fine_root_weight)
+            self._save_heatmap(combined_norm, self.vis_dir / f"{name}_votes_combined.png")
 
         # ── Merge: per-channel thresholds + cross-channel agreement ───────────
-        mask_a      = vote_a >= self.vote_threshold_a
-        mask_b      = vote_b >= self.vote_threshold_b
-        both_agree  = (vote_a > 0) & (vote_b > 0)   # any vote from each channel
-        merged_mask = mask_a | mask_b | both_agree
+        mask_a = vote_a >= self.vote_threshold_a
+        if self.fine_roots:
+            mask_b      = vote_b >= self.vote_threshold_b
+            both_agree  = (vote_a > 0) & (vote_b > 0)
+            merged_mask = mask_a | mask_b | both_agree
+        else:
+            merged_mask = mask_a
 
         # Thin + light cleanup
         skel_merged = skeletonize(merged_mask)
         skel_merged = prune_skeleton(skel_merged, 20, 1)
 
         # Channel attribution on the final skeleton
-        px_a_only  = int((skel_merged & mask_a & ~both_agree & ~mask_b).sum())
-        px_b_only  = int((skel_merged & mask_b & ~both_agree & ~mask_a).sum())
-        px_both    = int((skel_merged & both_agree).sum())
-        print(f"    Skeleton px — A-only:{px_a_only}  B-only:{px_b_only}  "
-              f"cross-channel:{px_both}  total:{int(skel_merged.sum())}")
+        if self.fine_roots:
+            px_a_only = int((skel_merged & mask_a & ~both_agree & ~mask_b).sum())
+            px_b_only = int((skel_merged & mask_b & ~both_agree & ~mask_a).sum())
+            px_both   = int((skel_merged & both_agree).sum())
+            print(f"    Skeleton px — A-only:{px_a_only}  B-only:{px_b_only}  "
+                  f"cross-channel:{px_both}  total:{int(skel_merged.sum())}")
+        else:
+            print(f"    Skeleton px — total:{int(skel_merged.sum())}")
 
         # Save merged binary
         cv2.imwrite(
@@ -4542,18 +4550,21 @@ class EnsemblePipeline:
             skel_merged.astype(np.uint8) * 255,
         )
 
-        # Color-coded overlay: A=cyan, B=yellow, cross-channel=green
-        rgb     = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        dil_se  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Color-coded overlay: A=cyan (always); B=yellow, cross-channel=green only with --fine-roots
+        rgb    = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        dil_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
         def _paint(mask, color):
             m = skel_merged & mask
             if m.any():
                 rgb[cv2.dilate(m.astype(np.uint8), dil_se).astype(bool)] = color
 
-        _paint(mask_a & ~both_agree & ~mask_b, (255, 255, 0))   # cyan  — A only
-        _paint(mask_b & ~both_agree & ~mask_a, (0,   255, 255))  # yellow — B only
-        _paint(both_agree,                      (0,   255, 0))    # green  — both
+        if self.fine_roots:
+            _paint(mask_a & ~both_agree & ~mask_b, (255, 255, 0))   # cyan  — A only
+            _paint(mask_b & ~both_agree & ~mask_a, (0,   255, 255))  # yellow — B only
+            _paint(both_agree,                      (0,   255, 0))    # green  — both
+        else:
+            _paint(mask_a, (255, 255, 0))                            # cyan  — A
 
         cv2.imwrite(str(self.vis_dir / f"{name}_final_primary.png"), rgb)
 
@@ -4825,11 +4836,12 @@ class RhizotronPipeline:
         save_roi_coordinates(all_rois, str(self.output_dir / "roi_coordinates.csv"))
         save_similarity_matrix(sim_matrix_df, str(self.output_dir / "similarity_matrix.csv"))
         save_match_details(all_rois, matches_df, str(self.output_dir / "matched_rois_detail.csv"))
-        save_visual_panel(
-            images, masks, matches_df,
-            str(self.output_dir / "comparison_panel.png"),
-            self.scale, self.bins,
-        )
+        panel_path = str(self.output_dir / "comparison_panel.png")
+        try:
+            save_visual_panel(images, masks, matches_df, panel_path, self.scale, self.bins)
+            print(f"  Saved comparison panel  → {panel_path}")
+        except Exception as exc:
+            print(f"  WARNING: comparison panel failed ({exc}) — other outputs still saved.")
 
         print(f"\n  All outputs written to: {self.output_dir}/\n")
 
@@ -4891,6 +4903,176 @@ def _find_images(directory: str) -> List[str]:
     if not paths:
         raise FileNotFoundError(f"No supported images found in: {directory}")
     return [str(f) for f in paths]
+
+
+def _load_config(path: str) -> dict:
+    """Load a JSON or YAML config file and return its contents as a dict."""
+    p = Path(path)
+    if not p.exists():
+        print(f"ERROR: config file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    text = p.read_text()
+    if p.suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+            return yaml.safe_load(text) or {}
+        except ImportError:
+            print(
+                "ERROR: PyYAML is not installed.  Install it with:\n"
+                "  pip install pyyaml\n"
+                "Or use a JSON config file instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: invalid JSON in config file {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _derive_scale(
+    image_path: str,
+    box_w_mm: float,
+    box_h_mm: float,
+) -> float:
+    """
+    Load the first rhizotron image, detect its interior crop dimensions, and
+    return the average px/mm scale derived from the known physical box size.
+
+    Also prints the calibration summary and warns when x/y scales diverge >5%.
+    """
+    try:
+        rh = RhizotronImage(image_path, scale_px_per_mm=1.0)
+    except Exception as exc:
+        print(f"ERROR: could not load image for scale derivation ({image_path}): {exc}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    iy1, ix1, iy2, ix2 = rh.interior_bbox
+    interior_w = ix2 - ix1
+    interior_h = iy2 - iy1
+
+    scale_x = interior_w / box_w_mm
+    scale_y = interior_h / box_h_mm
+    scale   = (scale_x + scale_y) / 2.0
+
+    print(f"  Rhizobox window  : {box_w_mm:.1f} mm × {box_h_mm:.1f} mm")
+    print(f"  Detected interior: {interior_w} px × {interior_h} px")
+    print(f"  Derived scale    : {scale_x:.2f} px/mm  (x)  {scale_y:.2f} px/mm  (y)")
+
+    divergence = abs(scale_x - scale_y) / max(scale_x, scale_y)
+    if divergence > 0.05:
+        print(
+            f"  WARNING: x and y scales differ by {divergence*100:.1f}% (>{5}%).\n"
+            f"  The image may not be orthogonally aligned, or the box dimensions\n"
+            f"  may be transposed.  Check --box-width-mm / --box-height-mm."
+        )
+
+    return scale
+
+
+def _resolve_calibration(args, image_paths: List[str]) -> None:
+    """
+    Merge config file values, derive px/mm scale from physical box dimensions,
+    and resolve ROI pixel size from mm dimensions.  Mutates args in place.
+
+    Priority for scale (high → low):
+      1. --scale on the CLI
+      2. scale_px_per_mm in the config file (non-null)
+      3. Derived from --box-width-mm / --box-height-mm (or config equivalents)
+      4. DEFAULT_SCALE_PX_PER_MM
+    """
+    # ── Load config (provides defaults for any unset flag) ────────────────────
+    cfg: dict = {}
+    if getattr(args, "config", None):
+        cfg = _load_config(args.config)
+
+    def _cfg(key: str, cast=float):
+        v = cfg.get(key)
+        return cast(v) if v is not None else None
+
+    # Resolve physical box and ROI dimensions: CLI wins over config
+    box_w_mm  = args.box_width_mm  if args.box_width_mm  is not None else _cfg("box_width_mm")
+    box_h_mm  = args.box_height_mm if args.box_height_mm is not None else _cfg("box_height_mm")
+    roi_w_mm  = args.roi_width_mm  if args.roi_width_mm  is not None else _cfg("roi_width_mm")
+    roi_h_mm  = args.roi_height_mm if args.roi_height_mm is not None else _cfg("roi_height_mm")
+    cfg_scale = _cfg("scale_px_per_mm")   # config-only; CLI --scale checked separately
+
+    # ── Determine effective scale ─────────────────────────────────────────────
+    if args.scale is not None:
+        # Explicit --scale on CLI — highest priority, skip derivation
+        effective_scale = args.scale
+        if box_w_mm is not None or box_h_mm is not None:
+            print(
+                "  NOTE: --scale provided on CLI; "
+                "--box-width-mm / --box-height-mm ignored for scale derivation."
+            )
+    elif cfg_scale is not None:
+        # Config has an explicit scale — overrides box-dimension derivation
+        effective_scale = cfg_scale
+        if box_w_mm is not None or box_h_mm is not None:
+            print(
+                f"  NOTE: scale_px_per_mm={cfg_scale} set in config; "
+                "box dimensions not used for scale derivation."
+            )
+    elif box_w_mm is not None and box_h_mm is not None:
+        # Derive from physical box dimensions
+        if not image_paths:
+            print(
+                "ERROR: --box-width-mm / --box-height-mm require at least one image "
+                "to detect interior dimensions.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        effective_scale = _derive_scale(image_paths[0], box_w_mm, box_h_mm)
+    elif box_w_mm is not None or box_h_mm is not None:
+        print(
+            "ERROR: both --box-width-mm and --box-height-mm must be provided together.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        effective_scale = DEFAULT_SCALE_PX_PER_MM
+
+    # ── Validate scale ────────────────────────────────────────────────────────
+    if not (1.0 <= effective_scale <= 50.0):
+        print(
+            f"ERROR: scale {effective_scale:.3f} px/mm is outside the plausible range "
+            f"1–50 px/mm.\n"
+            f"  Check that --box-width-mm / --box-height-mm match the actual rhizobox\n"
+            f"  window dimensions and that the correct image directory is being used.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    args.scale = effective_scale
+
+    # ── Resolve ROI size from mm dimensions ───────────────────────────────────
+    if roi_w_mm is not None or roi_h_mm is not None:
+        if roi_w_mm is None or roi_h_mm is None:
+            print(
+                "ERROR: both --roi-width-mm and --roi-height-mm must be provided together.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        roi_px_w = int(round(roi_w_mm * effective_scale))
+        roi_px_h = int(round(roi_h_mm * effective_scale))
+        if roi_px_w != roi_px_h:
+            # ROIExtractor uses square windows — take the larger side
+            roi_size = max(roi_px_w, roi_px_h)
+            print(
+                f"  ROI size: {roi_w_mm:.1f} mm × {roi_h_mm:.1f} mm  "
+                f"→  {roi_px_w} px × {roi_px_h} px  "
+                f"(non-square; using {roi_size}×{roi_size} px square window)"
+            )
+        else:
+            roi_size = roi_px_w
+            print(
+                f"  ROI size: {roi_w_mm:.1f} mm × {roi_h_mm:.1f} mm  "
+                f"→  {roi_px_w} px × {roi_px_h} px"
+            )
+        args.roi_size = roi_size
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -4966,10 +5148,12 @@ Parameter-tuning notes
         help="Similarity metric for cross-plant ROI matching.  (default: cosine)",
     )
     parser.add_argument(
-        "--scale", type=float, default=DEFAULT_SCALE_PX_PER_MM, metavar="PX_PER_MM",
+        "--scale", type=float, default=None, metavar="PX_PER_MM",
         help=(
             "Image resolution in pixels per millimetre.  Calibrate by measuring "
-            f"a known object in your images.  (default: {DEFAULT_SCALE_PX_PER_MM})"
+            "a known object in your images.  "
+            "If --box-width-mm / --box-height-mm are given the scale is derived "
+            f"automatically and this flag is not needed.  (default: {DEFAULT_SCALE_PX_PER_MM})"
         ),
     )
     parser.add_argument(
@@ -4979,6 +5163,39 @@ Parameter-tuning notes
     parser.add_argument(
         "--roi-stride", type=int, default=None, metavar="PX",
         help="Stride between consecutive ROIs.  (default: roi-size // 2)",
+    )
+
+    # ── Physical calibration ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--config", default=None, metavar="FILE",
+        help=(
+            "JSON or YAML config file.  Keys: box_width_mm, box_height_mm, "
+            "roi_width_mm, roi_height_mm, scale_px_per_mm (null to derive).  "
+            "CLI flags override config values when both are provided."
+        ),
+    )
+    parser.add_argument(
+        "--box-width-mm", type=float, default=None, metavar="MM", dest="box_width_mm",
+        help=(
+            "Physical width of the root-viewable rhizobox window in mm.  "
+            "Used together with --box-height-mm to derive the px/mm scale "
+            "automatically from the detected interior pixel dimensions."
+        ),
+    )
+    parser.add_argument(
+        "--box-height-mm", type=float, default=None, metavar="MM", dest="box_height_mm",
+        help="Physical height of the root-viewable rhizobox window in mm.",
+    )
+    parser.add_argument(
+        "--roi-width-mm", type=float, default=None, metavar="MM", dest="roi_width_mm",
+        help=(
+            "ROI window width in mm.  Converted to pixels using the derived scale "
+            "and overrides --roi-size.  Must be paired with --roi-height-mm."
+        ),
+    )
+    parser.add_argument(
+        "--roi-height-mm", type=float, default=None, metavar="MM", dest="roi_height_mm",
+        help="ROI window height in mm.  Must be paired with --roi-width-mm.",
     )
     parser.add_argument(
         "--tophat-radius", type=float, default=2.5, metavar="MM",
@@ -5554,6 +5771,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(1)
 
     print(f"Found {len(image_paths)} images in '{args.images}'")
+
+    # ── Physical calibration: resolve scale and ROI size ──────────────────────
+    _resolve_calibration(args, image_paths)
 
     # ── --conservative preset overrides individual lateral flags ──────────────
     if args.conservative:
