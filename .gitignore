@@ -9,3 +9,16 @@ __pycache__/
 *.pkl
 *.joblib
 .DS_Store
+
+# User-specific image inputs and curation outputs
+realimages/
+testimages/
+curated_skeletons/
+curation_backups/
+
+# Sync / runtime logs
+*.log
+
+# Claude Code local-machine settings (team-shared rules go in
+# .claude/settings.json; per-user one-offs in settings.local.json)
+.claude/settings.local.json
