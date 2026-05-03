@@ -42,6 +42,7 @@ from skimage.filters import frangi, threshold_local
 from skimage.measure import label as sk_label, regionprops
 from skimage.morphology import (
     closing,
+    dilation as sk_dilation,
     disk,
     erosion,
     remove_small_objects,
@@ -260,6 +261,134 @@ def _save_debug_skeleton(
     display[skel] = (0, 100, 255)   # orange skeleton
     out_path = Path(debug_dir) / f"{stem}_03_skeleton.png"
     cv2.imwrite(str(out_path), display)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Color-based root probability mask  (early filtering layer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_effectively_grayscale(bgr: np.ndarray) -> bool:
+    """True if the BGR array carries no chroma (all three channels identical)."""
+    if bgr.ndim != 3 or bgr.shape[2] < 3:
+        return True
+    # Cheap check — equality of B and G channels is enough in practice; OpenCV
+    # always returns 3-channel BGR even for grayscale source files.
+    return bool(np.array_equal(bgr[..., 0], bgr[..., 1])
+                and np.array_equal(bgr[..., 1], bgr[..., 2]))
+
+
+def compute_color_mask(
+    bgr_interior: np.ndarray,
+    interior_mask: Optional[np.ndarray] = None,
+    local_soil_radius: float = 20.0,
+    local_lightness_radius: float = 15.0,
+    chroma_weight: float = 0.7,
+    glare_percentile: float = 98.0,
+    return_debug: bool = False,
+):
+    """
+    Per-pixel root probability via *chromaticity suppression*.
+
+    Roots in these images are not absolutely bright — they are *less brown*
+    than the wet soil immediately surrounding them.  In LAB space soil has
+    strong positive a* and b* (iron-oxide warm cast); roots are near-neutral.
+    A pixel that is locally less chromatic than its neighbourhood scores high.
+
+    Pipeline:
+      1. soil_score        = 0.6 * a* + 0.4 * b*      (a*, b* signed, neutral=0)
+      2. root_color_raw    = local_mean(soil_score, σ=local_soil_radius) - soil_score
+      3. lightness_contrast = L - local_mean(L, σ=local_lightness_radius)
+      4. Each component normalised to [0,1] using percentile range computed
+         on interior_mask pixels only (excludes the dark frame border that
+         would otherwise compress the dynamic range).
+      5. color_prob = chroma_weight * chrom_norm + (1 - chroma_weight) * light_norm
+      6. Hard-zero specular glare: pixels where R, G, B all exceed the
+         glare_percentile of interior pixel values (sets to 0).
+
+    Returns float32 array of shape (H, W) with values in [0, 1].
+    Pixels outside *interior_mask* are forced to 0.
+
+    If return_debug=True, returns (color_prob, {a_channel, b_channel,
+    color_prob_raw}) for diagnostic image saving.
+    """
+    h, w = bgr_interior.shape[:2]
+
+    if interior_mask is None:
+        interior_mask = np.ones((h, w), dtype=bool)
+    interior_mask = interior_mask.astype(bool, copy=False)
+
+    if _is_effectively_grayscale(bgr_interior):
+        ones = np.ones((h, w), dtype=np.float32)
+        ones[~interior_mask] = 0.0
+        if return_debug:
+            zero = np.zeros((h, w), dtype=np.uint8)
+            return ones, {"lab_a_channel": zero, "lab_b_channel": zero,
+                          "color_prob_raw": ones.copy()}
+        return ones
+
+    lab = cv2.cvtColor(bgr_interior, cv2.COLOR_BGR2LAB)
+    L_chan = lab[..., 0].astype(np.float32)
+    a_chan = lab[..., 1].astype(np.float32) - 128.0   # OpenCV stores a*,b* offset by +128
+    b_chan = lab[..., 2].astype(np.float32) - 128.0
+
+    # 1–2: chromaticity suppression
+    soil_score      = 0.6 * a_chan + 0.4 * b_chan
+    local_mean_soil = cv2.GaussianBlur(
+        soil_score, (0, 0), sigmaX=float(local_soil_radius)
+    )
+    root_color_raw  = local_mean_soil - soil_score
+
+    # 3: weak lightness contrast (secondary signal)
+    local_mean_L      = cv2.GaussianBlur(
+        L_chan, (0, 0), sigmaX=float(local_lightness_radius)
+    )
+    lightness_contrast = L_chan - local_mean_L
+
+    # 4: normalise each component using interior-only percentile range
+    def _norm_interior(arr: np.ndarray) -> np.ndarray:
+        vals = arr[interior_mask]
+        if vals.size == 0:
+            return np.zeros_like(arr, dtype=np.float32)
+        lo = float(np.percentile(vals, 5))
+        hi = float(np.percentile(vals, 95))
+        if hi - lo < 1e-6:
+            return np.zeros_like(arr, dtype=np.float32)
+        return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+    chrom_norm = _norm_interior(root_color_raw)
+    light_norm = _norm_interior(lightness_contrast)
+
+    # 5: combined probability — chromaticity does most of the work
+    cw = float(np.clip(chroma_weight, 0.0, 1.0))
+    color_prob = (cw * chrom_norm + (1.0 - cw) * light_norm).astype(np.float32)
+
+    # Save the pre-glare combined probability for the debug output
+    color_prob_raw = color_prob.copy()
+
+    # 6: hard-zero specular glare (R, G, B all above 98th percentile of interior)
+    if interior_mask.any():
+        interior_px = bgr_interior[interior_mask]   # (N, 3) BGR
+        r_thr = float(np.percentile(interior_px[:, 2], glare_percentile))
+        g_thr = float(np.percentile(interior_px[:, 1], glare_percentile))
+        b_thr = float(np.percentile(interior_px[:, 0], glare_percentile))
+        glare = (
+            (bgr_interior[..., 2] > r_thr) &
+            (bgr_interior[..., 1] > g_thr) &
+            (bgr_interior[..., 0] > b_thr)
+        )
+        color_prob[glare] = 0.0
+
+    # Force outside-interior to zero
+    color_prob[~interior_mask] = 0.0
+    color_prob = np.clip(color_prob, 0.0, 1.0)
+
+    if return_debug:
+        return color_prob, {
+            "lab_a_channel": np.clip(a_chan + 128.0, 0, 255).astype(np.uint8),
+            "lab_b_channel": np.clip(b_chan + 128.0, 0, 255).astype(np.uint8),
+            "color_prob_raw": color_prob_raw,
+        }
+    return color_prob
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3795,7 +3924,9 @@ def _run_primary_for_ensemble(args_tuple: tuple):
     (path, scale, tophat_radius, frame_margin,
      blur_sigma, tophat_percentile, close_radius,
      prune_length, prune_passes, min_seg_len,
-     vis_dir_str, run_idx, save_individual) = args_tuple
+     vis_dir_str, run_idx, save_individual,
+     color_gate, local_soil_radius, local_lightness_radius,
+     chroma_weight, glare_percentile) = args_tuple
 
     try:
         rh   = RhizotronImage(path, scale)
@@ -3831,6 +3962,29 @@ def _run_primary_for_ensemble(args_tuple: tuple):
         if m > 0:
             binary[:m, :] = 0;  binary[ih - m:, :] = 0
             binary[:, :m] = 0;  binary[:, iw - m:] = 0
+
+        # Step 3.5: chromaticity-suppression color gate (opt-in)
+        if color_gate is not None:
+            bgr_int = rh.interior_crop
+            if not _is_effectively_grayscale(bgr_int):
+                interior_mask = np.zeros((ih, iw), dtype=bool)
+                if m > 0 and 2 * m < ih and 2 * m < iw:
+                    interior_mask[m:ih - m, m:iw - m] = True
+                else:
+                    interior_mask[:] = True
+                color_mask = compute_color_mask(
+                    bgr_int,
+                    interior_mask=interior_mask,
+                    local_soil_radius=local_soil_radius,
+                    local_lightness_radius=local_lightness_radius,
+                    chroma_weight=chroma_weight,
+                    glare_percentile=glare_percentile,
+                )
+                color_pass = color_mask > color_gate
+                if m > 0:
+                    color_pass[:m, :] = False;  color_pass[ih - m:, :] = False
+                    color_pass[:, :m] = False;  color_pass[:, iw - m:] = False
+                binary[~color_pass] = 0
 
         # Step 4: morphological closing
         to_skel = (closing(binary.astype(bool), disk(close_radius))
@@ -4000,6 +4154,14 @@ class PrimaryOnlyPipeline:
         no_prune: bool = False,
         with_diameter: bool = False,
         n_jobs: int = 1,
+        # Color-mask parameters (chromaticity-suppression).  Gate is ON by
+        # default at 0.7; pass color_gate=None to disable (mask is then
+        # computed for diagnostics only and the binary is NOT gated).
+        color_gate: Optional[float] = 0.7,
+        local_soil_radius: float = 20.0,
+        local_lightness_radius: float = 15.0,
+        chroma_weight: float = 0.7,
+        glare_percentile: float = 98.0,
     ):
         self.image_paths      = image_paths
         self.output_dir       = Path(output_dir)
@@ -4016,6 +4178,13 @@ class PrimaryOnlyPipeline:
         self.no_prune         = no_prune
         self.with_diameter    = with_diameter
         self.n_jobs           = max(1, n_jobs)
+
+        # Color mask / gate
+        self.color_gate             = color_gate
+        self.local_soil_radius      = float(local_soil_radius)
+        self.local_lightness_radius = float(local_lightness_radius)
+        self.chroma_weight          = float(chroma_weight)
+        self.glare_percentile       = float(glare_percentile)
 
         self.vis_dir = self.output_dir / "primary_only"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
@@ -4108,6 +4277,70 @@ class PrimaryOnlyPipeline:
         _save("s3_binary", binary)
         print(f"    s3 tophat {self.tophat_percentile}th-pct threshold: "
               f"cutoff={thresh_val:.1f}  bright={bright_pct:.1f}% of all px")
+
+        # ── Step 3.5: color-based root probability mask & optional gate ───────
+        # Pipeline step order at this point:
+        #   s0_cropped → s1_tophat → s2_blurred → s3_binary →
+        #   [s3.5 color gate (this step, runs BEFORE s4 closing)] →
+        #   s4_closed → s5_mask → s6_skeleton → s7_pruned
+        bgr_int = rh.interior_crop  # BGR, same H×W as gray
+        print(f"    s3.5 color image: shape={bgr_int.shape}  dtype={bgr_int.dtype}  "
+              f"channels={bgr_int.shape[2] if bgr_int.ndim == 3 else 'NONE'}")
+
+        if _is_effectively_grayscale(bgr_int):
+            print("    s3.5 color mask: WARNING — no color channels found, "
+                  "skipping color mask, results may include more false positives.")
+        else:
+            interior_mask = np.zeros((ih, iw), dtype=bool)
+            if m > 0 and 2 * m < ih and 2 * m < iw:
+                interior_mask[m:ih - m, m:iw - m] = True
+            else:
+                interior_mask[:] = True
+
+            color_mask, cm_dbg = compute_color_mask(
+                bgr_int,
+                interior_mask=interior_mask,
+                local_soil_radius=self.local_soil_radius,
+                local_lightness_radius=self.local_lightness_radius,
+                chroma_weight=self.chroma_weight,
+                glare_percentile=self.glare_percentile,
+                return_debug=True,
+            )
+            # Diagnostic outputs
+            _save("lab_a_channel",  cm_dbg["lab_a_channel"])
+            _save("lab_b_channel",  cm_dbg["lab_b_channel"])
+            _save("color_prob_raw", (cm_dbg["color_prob_raw"] * 255).astype(np.uint8))
+            _save("color_mask",     (color_mask              * 255).astype(np.uint8))
+
+            if self.color_gate is not None:
+                # Coordinate-space sanity check before any multiplication
+                assert color_mask.shape == binary.shape, (
+                    f"Shape mismatch: color_mask {color_mask.shape} vs "
+                    f"binary {binary.shape}"
+                )
+                color_pass = color_mask > self.color_gate
+                if m > 0:
+                    color_pass[:m, :] = False;  color_pass[ih - m:, :] = False
+                    color_pass[:, :m] = False;  color_pass[:, iw - m:] = False
+                pixels_before = int(binary.astype(bool).sum())
+                binary[~color_pass] = 0
+                pixels_after  = int(binary.astype(bool).sum())
+                _save("color_gated", binary)
+                removed = pixels_before - pixels_after
+                pct = (100.0 * removed / pixels_before) if pixels_before > 0 else 0.0
+                print(
+                    f"    s3.5 color gate APPLIED: thr={self.color_gate:.2f}  "
+                    f"chroma_w={self.chroma_weight:.2f}  "
+                    f"soil_σ={self.local_soil_radius:.0f}  "
+                    f"L_σ={self.local_lightness_radius:.0f}\n"
+                    f"    s3.5 color gate removed {removed} pixels "
+                    f"({pct:.1f}% of {pixels_before})  →  kept {pixels_after}"
+                )
+            else:
+                print(f"    s3.5 color mask computed (gate OFF — pass "
+                      f"--color-gate PROB to enable).  "
+                      f"chroma_w={self.chroma_weight:.2f}  "
+                      f"soil_σ={self.local_soil_radius:.0f}")
 
         # ── Step 4: morphological closing (gated by --skip-morphology) ────────
         if self.skip_morphology or self.close_radius <= 0:
@@ -4333,6 +4566,24 @@ class EnsemblePipeline:
         min_segment_length: int = 100,
         save_individual: bool = False,
         n_jobs: int = 1,
+        # Stage 4 (cross-image ROI matching) parameters
+        bins: Optional[List[float]] = None,
+        metric: str = "cosine",
+        roi_size_px: int = DEFAULT_ROI_SIZE_PX,
+        roi_stride_px: Optional[int] = None,
+        min_roi_density: float = 0.002,
+        min_skeleton_density: float = 0.005,
+        dilate_skeleton: int = 2,
+        border_margin: int = 100,
+        # Color-mask parameters (chromaticity-suppression).  Gate is ON by
+        # default at 0.7; pass color_gate=None to disable.
+        color_gate: Optional[float] = 0.7,
+        local_soil_radius: float = 20.0,
+        local_lightness_radius: float = 15.0,
+        chroma_weight: float = 0.7,
+        glare_percentile: float = 98.0,
+        # Manual-curation override
+        curated_skeletons_dir: Optional[str] = None,
     ):
         self.image_paths      = image_paths
         self.output_dir       = Path(output_dir)
@@ -4351,6 +4602,29 @@ class EnsemblePipeline:
         self.min_seg_len      = min_segment_length
         self.save_individual  = save_individual
         self.n_jobs           = max(1, n_jobs)
+
+        # Stage 4 config
+        self.bins                 = list(bins) if bins is not None else list(DEFAULT_BINS_MM)
+        self.metric               = metric
+        self.roi_size_px          = roi_size_px
+        self.roi_stride_px        = roi_stride_px
+        self.min_roi_density      = min_roi_density
+        self.min_skeleton_density = min_skeleton_density
+        self.dilate_skeleton      = dilate_skeleton
+        self.border_margin        = border_margin
+
+        # Color mask / gate
+        self.color_gate             = color_gate
+        self.local_soil_radius      = float(local_soil_radius)
+        self.local_lightness_radius = float(local_lightness_radius)
+        self.chroma_weight          = float(chroma_weight)
+        self.glare_percentile       = float(glare_percentile)
+
+        # Manual-curation override
+        self.curated_dir = (
+            Path(curated_skeletons_dir).resolve()
+            if curated_skeletons_dir else None
+        )
 
         self.vis_dir = self.output_dir / "ensemble"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
@@ -4377,6 +4651,19 @@ class EnsemblePipeline:
     def _generate_fine_param_sets(self) -> List[dict]:
         """Channel B: up to n_fine_runs combos — fine_tophat × adaptive_block × frangi_scale."""
         rng          = np.random.default_rng(self.seed + 1)
+        # TUNE: fine_tophat_radius (default sweep [5, 8, 12] px)
+        # What it does: small-kernel top-hat radius (in pixels, NOT mm) used
+        #   by Channel B (fine-root detection, --fine-roots).  The thinnest
+        #   roots in your images are roughly this many pixels wide.
+        # INCREASE (e.g. [8, 12, 18]) if: your fine roots are wider than the
+        #   defaults assume — Channel B will miss them as too narrow.
+        # DECREASE (e.g. [3, 5, 8]) if: extremely thin roots / hyphae need
+        #   to be detected.  Smaller kernels respond to thinner structures.
+        # AVOID: values > 25 — the small-kernel tophat stops being "small"
+        #   and the channel duplicates Channel A's coarse detection.
+        # INTERACTS WITH: adaptive_block (the threshold-local block size;
+        #   should comfortably cover several tophat radii), and the Channel
+        #   B vote_threshold_b (which is held stricter than Channel A's).
         tophat_opts  = [5, 8, 12]
         block_opts   = [31, 51, 71]
         scale_opts   = [1.0, 1.5, 2.0]
@@ -4392,9 +4679,46 @@ class EnsemblePipeline:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
+    def _curated_path_for(self, name: str) -> Optional[Path]:
+        if self.curated_dir is None:
+            return None
+        p = self.curated_dir / f"{name}_curated_skeleton.png"
+        return p if p.is_file() else None
+
+    def _load_curated(self, name: str, expected_shape: Tuple[int, int]
+                      ) -> Optional[np.ndarray]:
+        p = self._curated_path_for(name)
+        if p is None:
+            return None
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"  WARNING: could not read curated skeleton {p} — skipping override")
+            return None
+        if img.shape != expected_shape:
+            print(
+                f"  WARNING: curated skeleton shape {img.shape} != "
+                f"interior {expected_shape} for {name} — skipping override"
+            )
+            return None
+        return img > 0
+
     def run(self) -> None:
         param_sets_a = self._generate_param_sets()
         param_sets_b = self._generate_fine_param_sets() if self.fine_roots else []
+
+        # Count curated overrides up front so the user sees the integration status
+        if self.curated_dir is not None:
+            curated_count = sum(
+                1 for p in self.image_paths
+                if self._curated_path_for(Path(p).stem) is not None
+            )
+            print(
+                f"  Curated skeletons: ON — using curated skeleton for "
+                f"{curated_count}/{len(self.image_paths)} images  "
+                f"(dir: {self.curated_dir})"
+            )
+        else:
+            print("  Curated skeletons: OFF")
 
         b_status = (
             f"ON (--fine-roots)  {len(param_sets_b)} runs  "
@@ -4407,6 +4731,20 @@ class EnsemblePipeline:
             f"  Channel A (large roots): {self.n_runs} runs  thr_A={self.vote_threshold_a}\n"
             f"  Channel B (fine roots):  {b_status}"
         )
+        if self.color_gate is not None:
+            gate_line = (
+                f"  Color gate       : ON  (threshold={self.color_gate:.2f}) "
+                f"— pass --no-color-gate to disable"
+            )
+        else:
+            gate_line = "  Color gate       : OFF"
+        print(gate_line)
+        print(
+            f"                     (chroma_w={self.chroma_weight:.2f}  "
+            f"soil_σ={self.local_soil_radius:.0f}  "
+            f"L_σ={self.local_lightness_radius:.0f}  "
+            f"glare_pct={self.glare_percentile:.0f})"
+        )
         print("  Channel A sweep:")
         for i, p in enumerate(param_sets_a):
             print(f"    A{i:02d}: pct={p['tophat_percentile']:.1f}  "
@@ -4418,9 +4756,15 @@ class EnsemblePipeline:
                       f"blk={p['adaptive_block']}  fs_max={p['frangi_scale_max']}")
 
         all_rows: List[Dict] = []
+        processed: List[Tuple["RhizotronImage", np.ndarray]] = []
         for path in self.image_paths:
             try:
-                all_rows.extend(self._process_image(path, param_sets_a, param_sets_b))
+                rows, rh, dilated_mask = self._process_image(
+                    path, param_sets_a, param_sets_b,
+                )
+                all_rows.extend(rows)
+                if rh is not None and dilated_mask is not None:
+                    processed.append((rh, dilated_mask))
             except Exception as exc:
                 print(f"  ERROR [{Path(path).stem}]: {exc}")
 
@@ -4433,6 +4777,9 @@ class EnsemblePipeline:
             print("\n  No ensemble root segments detected.")
         print(f"  Debug images → {self.vis_dir}/")
 
+        # ── Stage 3 + Stage 4: cross-image ROI extraction & matching ─────────
+        self._run_stage4(processed)
+
     # ── Per-image ensemble ────────────────────────────────────────────────────
 
     def _process_image(
@@ -4440,11 +4787,34 @@ class EnsemblePipeline:
         path: str,
         param_sets_a: List[dict],
         param_sets_b: List[dict],
-    ) -> List[Dict]:
+    ) -> Tuple[List[Dict], Optional["RhizotronImage"], Optional[np.ndarray]]:
         rh   = RhizotronImage(path, self.scale)
         gray = rh.interior_gray
         name = rh.name
         n_b  = len(param_sets_b)
+
+        # ── Manual-curation override ──────────────────────────────────────────
+        # If a {name}_curated_skeleton.png exists in --curated-skeletons,
+        # bypass the parameter sweep entirely and use the human-curated
+        # skeleton as if it were the ensemble output.
+        curated = self._load_curated(name, gray.shape)
+        if curated is not None:
+            print(f"\n  [{name}]  CURATED skeleton override  "
+                  f"({int(curated.sum())} px)")
+            cv2.imwrite(
+                str(self.vis_dir / f"{name}_ensemble_skeleton.png"),
+                curated.astype(np.uint8) * 255,
+            )
+            n_segs = nd_label(curated, structure=np.ones((3, 3), dtype=int))[1]
+            rows   = self._extract_segments(curated, name)
+            print(f"    → {n_segs} components  {len(rows)} segment(s)  "
+                  f"(curated, no sweep run)")
+            if self.dilate_skeleton > 0:
+                stage4_mask = sk_dilation(curated, disk(self.dilate_skeleton))
+            else:
+                stage4_mask = curated.copy()
+            return rows, rh, stage4_mask
+
         print(f"\n  [{name}]  {gray.shape[1]}×{gray.shape[0]} px  "
               f"— A:{self.n_runs} sweeps  B:{n_b} sweeps")
 
@@ -4453,7 +4823,10 @@ class EnsemblePipeline:
             (path, self.scale, self.tophat_radius, self.frame_margin,
              p["blur_sigma"], p["tophat_percentile"], p["close_radius"],
              self.prune_length, self.prune_passes, self.min_seg_len,
-             str(self.vis_dir), i, self.save_individual)
+             str(self.vis_dir), i, self.save_individual,
+             self.color_gate, self.local_soil_radius,
+             self.local_lightness_radius, self.chroma_weight,
+             self.glare_percentile)
             for i, p in enumerate(param_sets_a)
         ]
         args_b = [
@@ -4503,7 +4876,7 @@ class EnsemblePipeline:
 
         if n_a == 0 and n_b_valid == 0:
             print(f"    All runs failed — skipping {name}")
-            return []
+            return [], None, None
 
         # Print stats
         print(f"    A: {n_a}/{self.n_runs} valid  "
@@ -4571,7 +4944,15 @@ class EnsemblePipeline:
         n_segs = nd_label(skel_merged, structure=np.ones((3, 3), dtype=int))[1]
         rows   = self._extract_segments(skel_merged, name)
         print(f"    → {n_segs} components  {len(rows)} segment(s)")
-        return rows
+
+        # Dilate the merged 1-px skeleton so the Stage 4 density pre-filter has
+        # enough coverage to find root-bearing windows.  Mirrors regen_stage4.py.
+        if self.dilate_skeleton > 0:
+            stage4_mask = sk_dilation(skel_merged, disk(self.dilate_skeleton))
+        else:
+            stage4_mask = skel_merged.copy()
+
+        return rows, rh, stage4_mask
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -4616,6 +4997,111 @@ class EnsemblePipeline:
                 "end_y":   ey, "end_x":   ex,
             })
         return rows
+
+    # ── Stage 3 + 4: cross-image ROI extraction & matching ───────────────────
+
+    def _run_stage4(
+        self,
+        processed: List[Tuple["RhizotronImage", np.ndarray]],
+    ) -> None:
+        """
+        Run ROI extraction on each processed image's dilated skeleton mask, then
+        cross-plant matching, and write the four Stage 4 outputs:
+
+            roi_coordinates.csv
+            similarity_matrix.csv
+            matched_rois_detail.csv
+            comparison_panel.png
+        """
+        if len(processed) < 2:
+            print(
+                f"\n  [Stage 4]  Skipped — need ≥2 successfully processed images "
+                f"for cross-image matching (got {len(processed)})."
+            )
+            return
+
+        print(
+            f"\n  [Stage 4]  Extracting ROIs and matching across "
+            f"{len(processed)} image(s)..."
+        )
+        extractor = ROIExtractor(
+            roi_size_px=self.roi_size_px,
+            stride_px=self.roi_stride_px,
+            min_root_density=self.min_roi_density,
+            min_skeleton_density=self.min_skeleton_density,
+        )
+
+        images: List["RhizotronImage"] = []
+        masks: Dict[str, np.ndarray] = {}
+        all_rois: List[Dict] = []
+
+        for rh, mask in processed:
+            ih, iw = rh.interior_gray.shape
+            if mask.shape != (ih, iw):
+                print(
+                    f"    WARNING: skeleton shape {mask.shape} != interior "
+                    f"crop shape {(ih, iw)} for {rh.name} — skipping."
+                )
+                continue
+            print(
+                f"    [{rh.name}]  extracting ROIs "
+                f"(mask coverage {int(mask.sum())} px)..."
+            )
+            rois = extractor.extract_rois(
+                rh, mask, None, self.bins, n_workers=self.n_jobs,
+            )
+            print(f"    [{rh.name}]  → {len(rois)} ROIs")
+            images.append(rh)
+            masks[rh.name] = mask
+            all_rois.extend(rois)
+
+        if len(images) < 2 or len(all_rois) < 2:
+            print(
+                f"\n  [Stage 4]  Aborted — not enough ROIs across images "
+                f"(images={len(images)}, ROIs={len(all_rois)})."
+            )
+            return
+
+        print(
+            f"\n  [Stage 3]  Matching ROIs  (border_margin={self.border_margin}px, "
+            f"metric={self.metric})..."
+        )
+        matches_df, sim_matrix_df = match_rois_across_plants(
+            all_rois, self.metric, top_k=3, border_margin=self.border_margin,
+        )
+        print(f"             Match pairs generated: {len(matches_df)}")
+        if not sim_matrix_df.empty:
+            upper = sim_matrix_df.values[
+                np.triu_indices(len(sim_matrix_df), k=1)
+            ]
+            if upper.size > 0:
+                print(
+                    f"             Inter-plant similarity — "
+                    f"mean {upper.mean():.3f}  min {upper.min():.3f}  "
+                    f"max {upper.max():.3f}"
+                )
+
+        print("  [Stage 4]  Writing outputs...")
+        save_roi_coordinates(
+            all_rois, str(self.output_dir / "roi_coordinates.csv"),
+        )
+        save_similarity_matrix(
+            sim_matrix_df, str(self.output_dir / "similarity_matrix.csv"),
+        )
+        save_match_details(
+            all_rois, matches_df,
+            str(self.output_dir / "matched_rois_detail.csv"),
+        )
+        panel_path = str(self.output_dir / "comparison_panel.png")
+        try:
+            save_visual_panel(
+                images, masks, matches_df, panel_path, self.scale, self.bins,
+            )
+            print(f"  Saved comparison panel  → {panel_path}")
+        except Exception as exc:
+            print(f"  WARNING: comparison panel failed ({exc}) — other outputs still saved.")
+
+        print(f"  Stage 4 outputs written to: {self.output_dir}/")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5212,6 +5698,16 @@ Parameter-tuning notes
         "--min-primary-diameter", type=float, default=0.5, metavar="MM",
         help="Diameter threshold (mm) separating primary from lateral roots.  (default: 0.5)  # TUNE",
     )
+    # TUNE: min_segment_length (default 30 px)
+    # What it does: discards skeleton segments shorter than this after pruning;
+    #   removes random short stubs caused by soil-texture noise.
+    # INCREASE (e.g. 60-100) if: many short spurious "roots" survive in the
+    #   final overlay, especially in high-noise areas.
+    # DECREASE (e.g. 15-25) if: real short root tips or lateral fragments are
+    #   being filtered out (visible in s7_skel_pruned but not in s7_final).
+    # AVOID: values > 200 — will eliminate genuinely short laterals and tips.
+    # INTERACTS WITH: prune_length, prune_passes (these together determine
+    #   how aggressively short branches are removed).
     parser.add_argument(
         "--min-segment-length", type=int, default=30, metavar="PX",
         help=(
@@ -5355,27 +5851,57 @@ Parameter-tuning notes
     )
 
     # ── Lateral root precision controls ──────────────────────────────────────
+    # TUNE: prune_length (default DEFAULT_PRUNE_LENGTH = 50 px)
+    # What it does: removes terminal skeleton "stubs" shorter than this many
+    #   pixels before lateral counting; an iterative tip-pruning operation.
+    # INCREASE (e.g. 80-120) if: many false laterals appear at junctions /
+    #   noisy primary roots are sprouting tiny phantom branches.
+    # DECREASE (e.g. 20-30) if: real short laterals or root tips are being
+    #   eaten before they're counted.
+    # AVOID: values larger than your shortest real lateral — you'll erase
+    #   genuine biology.
+    # INTERACTS WITH: prune_passes (the *total* iterative removal length is
+    #   approximately prune_length × prune_passes); also min_lateral_length.
     parser.add_argument(
         "--prune-length", type=int, default=DEFAULT_PRUNE_LENGTH, metavar="PX",
         dest="prune_length",
         help=(
             "Remove terminal skeleton stubs shorter than this before lateral "
-            f"counting (iterative).  (default: {DEFAULT_PRUNE_LENGTH})"
+            f"counting (iterative).  (default: {DEFAULT_PRUNE_LENGTH})  # TUNE"
         ),
     )
+    # TUNE: prune_passes (default DEFAULT_PRUNE_PASSES = 3)
+    # What it does: how many iterative rounds of tip-pruning to run.  Each
+    #   round can expose new branch tips for the next round to prune.
+    # INCREASE (e.g. 5-7 with --conservative) if: even after prune_length is
+    #   set generously, junction artifacts remain.
+    # DECREASE (1-2) if: real laterals are being progressively eaten.
+    # AVOID: > 10 — may collapse entire fine-root networks.
+    # INTERACTS WITH: prune_length (multiplicative effect).
     parser.add_argument(
         "--prune-passes", type=int, default=DEFAULT_PRUNE_PASSES, metavar="N",
         dest="prune_passes",
         help=(
-            f"How many rounds of stub pruning to run.  (default: {DEFAULT_PRUNE_PASSES})"
+            f"How many rounds of stub pruning to run.  "
+            f"(default: {DEFAULT_PRUNE_PASSES})  # TUNE"
         ),
     )
+    # TUNE: min_lateral_length (default DEFAULT_MIN_LATERAL_LENGTH = 60 px)
+    # What it does: minimum branch length, in pixels, for a branch to be
+    #   counted as a lateral root.  Pure length gate; no shape checks.
+    # INCREASE (80-150) if: spurious branches at noisy junctions are being
+    #   counted as laterals.
+    # DECREASE (30-40) if: legitimate short laterals (e.g. lateral primordia)
+    #   are being missed.
+    # AVOID: < 15 — at this length nearly every junction artifact qualifies.
+    # INTERACTS WITH: prune_length (which removes shorter stubs first), and
+    #   min_lateral_persistence (length required to "settle into" a lateral).
     parser.add_argument(
         "--min-lateral-length", type=int, default=DEFAULT_MIN_LATERAL_LENGTH, metavar="PX",
         dest="min_lateral_length",
         help=(
             "Minimum skeleton length (px) to count a branch as a lateral root.  "
-            f"(default: {DEFAULT_MIN_LATERAL_LENGTH})"
+            f"(default: {DEFAULT_MIN_LATERAL_LENGTH})  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5413,6 +5939,19 @@ Parameter-tuning notes
             f"(default: {DEFAULT_MAX_DIAMETER_CV})"
         ),
     )
+    # TUNE: lateral_classifier_threshold (default DEFAULT_LATERAL_CLF_THRESHOLD = 0.7)
+    # What it does: stricter Random-Forest P(root) gate applied only to
+    #   lateral root candidates (the primary roots use --classifier-threshold).
+    #   Held higher than primary because laterals are thinner and easier
+    #   to confuse with soil texture.
+    # INCREASE (0.8-0.9) if: too many false laterals (texture / pore edges
+    #   classified as roots) appear in the output.
+    # DECREASE (0.5-0.6) if: real laterals are being filtered out and the
+    #   lateral_count column in the CSV looks artificially low.
+    # AVOID: requires a trained classifier (--train); without one, the
+    #   pre-skeleton and lateral classifier gates are skipped silently.
+    # INTERACTS WITH: classifier_threshold (primary), pre_skeleton_threshold
+    #   (applied to mask components even before skeletonization).
     parser.add_argument(
         "--lateral-classifier-threshold", type=float,
         default=DEFAULT_LATERAL_CLF_THRESHOLD, metavar="PROB",
@@ -5420,7 +5959,7 @@ Parameter-tuning notes
         help=(
             "Stricter P(root) threshold applied only to lateral candidates after "
             "primary/lateral classification.  Laterals are held to a higher bar "
-            f"than primaries.  (default: {DEFAULT_LATERAL_CLF_THRESHOLD})"
+            f"than primaries.  (default: {DEFAULT_LATERAL_CLF_THRESHOLD})  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5435,6 +5974,19 @@ Parameter-tuning notes
         ),
     )
     # ── Pre-skeleton mask filtering ───────────────────────────────────────────
+    # TUNE: pre_skeleton_threshold (default DEFAULT_PRE_SKELETON_THRESHOLD = 0.65)
+    # What it does: applies the trained Random-Forest P(root) classifier to
+    #   each connected component of the binary mask BEFORE skeletonization.
+    #   Components below this probability are erased outright — they never
+    #   get traced into the skeleton.
+    # INCREASE (0.75-0.85) if: large soil-aggregate blobs are being
+    #   skeletonized into branching networks of false roots.
+    # DECREASE (0.45-0.55) if: real root components are being removed before
+    #   they're traced (visible if s_pre_skeleton.png drops a lot of mask).
+    # AVOID: this gate runs ONLY when a trained classifier is loaded.
+    #   With --no-classifier or no model file, the gate is skipped silently.
+    # INTERACTS WITH: classifier_threshold (component-level RF gate AFTER
+    #   skeletonization); both can be active simultaneously.
     parser.add_argument(
         "--pre-skeleton-threshold", type=float,
         default=DEFAULT_PRE_SKELETON_THRESHOLD, metavar="PROB",
@@ -5443,7 +5995,7 @@ Parameter-tuning notes
             "Classifier P(root) gate applied to binary mask components BEFORE "
             "skeletonization.  Components scoring below this are removed so soil "
             "pore boundaries never reach the skeleton tracer.  Requires a trained "
-            f"classifier.  Set to 0 to disable.  (default: {DEFAULT_PRE_SKELETON_THRESHOLD})"
+            f"classifier.  Set to 0 to disable.  (default: {DEFAULT_PRE_SKELETON_THRESHOLD})  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5522,22 +6074,59 @@ Parameter-tuning notes
             "Validate each level before advancing."
         ),
     )
+    # TUNE: frame_margin (default 150 px)
+    # What it does: hard-crops this many pixels from each edge of the image
+    #   interior crop, zeroing them out before any analysis.  Removes the
+    #   white/metal rhizotron frame from the analysis region.
+    # INCREASE (200-300) if: bright frame edges or screws are still showing
+    #   up in s0_cropped.png and being detected as false roots.
+    # DECREASE (50-100) if: real roots near the frame edge are being eaten
+    #   (check s0_cropped.png — black border too thick).
+    # AVOID: setting > 1/4 of the smaller image dimension — you'll erase
+    #   most of the soil area.  Setting to 0 disables the safety crop and
+    #   the frame will reach the analysis pipeline.
+    # INTERACTS WITH: RhizotronImage._detect_interior() already auto-detects
+    #   the frame; frame_margin is a hard belt-and-suspenders crop applied
+    #   on top of that.
     parser.add_argument(
         "--frame-margin", type=int, default=150, metavar="PX",
         dest="frame_margin",
         help=(
             "Pixels cropped from each edge in --primary-only / --complexity 1-2 "
-            "mode to exclude the scanner frame border.  (default: 150)"
+            "mode to exclude the scanner frame border.  (default: 150)  # TUNE"
         ),
     )
+    # TUNE: blur_sigma (default 1.5)
+    # What it does: Gaussian smoothing sigma (in pixels) applied to the
+    #   tophat-enhanced image before percentile thresholding.  Suppresses
+    #   single-pixel JPEG / sensor noise.
+    # INCREASE (2.0-3.0) if: thresholded mask is full of speckled noise
+    #   (visible in s3_binary.png as small isolated dots).
+    # DECREASE (0.5-1.0) if: thinnest real roots are getting blurred away
+    #   below the detection threshold.
+    # AVOID: > 4 — root edges become indistinguishable from soil texture.
+    # INTERACTS WITH: tophat_percentile (more blur → lower percentile may
+    #   be needed to keep the same detection sensitivity).
     parser.add_argument(
         "--blur-sigma", type=float, default=1.5, metavar="SIGMA",
         dest="blur_sigma",
         help=(
             "Gaussian blur sigma applied after top-hat in --primary-only / "
-            "--complexity 1-2 mode.  (default: 1.5)"
+            "--complexity 1-2 mode.  (default: 1.5)  # TUNE"
         ),
     )
+    # TUNE: tophat_percentile (default 85.0)
+    # What it does: percentile of interior tophat values used as the binary
+    #   threshold.  Pixels above the Nth percentile become "root candidates"
+    #   in s3_binary.  85 means the brightest 15% of tophat-response pixels.
+    # INCREASE (88-92) if: s3_binary covers a dense network across the
+    #   entire image — too permissive for your image's contrast level.
+    # DECREASE (75-80) if: real roots are missing entirely from s3_binary
+    #   (especially faint or fine roots).
+    # AVOID: > 95 — you'll only catch the brightest root pixels and miss
+    #   most of the network.  < 70 — the binary becomes mostly soil texture.
+    # INTERACTS WITH: blur_sigma (more blur → lower threshold may be
+    #   appropriate); the ensemble sweeps this from 75 to 92 across runs.
     parser.add_argument(
         "--tophat-percentile", type=float, default=85.0, metavar="PCT",
         dest="tophat_percentile",
@@ -5545,16 +6134,29 @@ Parameter-tuning notes
             "Percentile of interior tophat pixel values used as the threshold "
             "in --primary-only / --complexity 1-2 mode.  Pixels above the "
             "Nth percentile are classified as root.  Lower = more permissive.  "
-            "(default: 85.0)"
+            "(default: 85.0)  # TUNE"
         ),
     )
+    # TUNE: close_radius (default 2 px)
+    # What it does: morphological closing disk radius (px) applied between
+    #   binary thresholding and skeletonization.  Bridges gaps within root
+    #   strands so the skeleton runs continuously through small breaks.
+    # INCREASE (4-6) if: skeleton fragments at every minor break — long
+    #   roots are showing up as many small segments.  Especially useful
+    #   AFTER the color gate, which can punch holes in real strands.
+    # DECREASE (0-1) if: nearby roots are merging into single thick blobs
+    #   that get skeletonized into a single mid-line between them.
+    # AVOID: > 8 — closes will start fusing parallel root strands.
+    # INTERACTS WITH: tophat_percentile (stricter threshold → use larger
+    #   close_radius to repair gaps); color_gate (gating fragments → larger
+    #   close_radius compensates).
     parser.add_argument(
         "--close-radius", type=int, default=2, metavar="PX",
         dest="close_radius",
         help=(
             "Morphological closing disk radius (px) in --primary-only / "
             "--complexity 1-2 mode.  Fills small gaps in root strands.  "
-            "(default: 2)"
+            "(default: 2)  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5565,6 +6167,17 @@ Parameter-tuning notes
             "directly.  Useful when s3_binary is already clean."
         ),
     )
+    # TUNE: primary_prune_length (default 20 px, used in --primary-only / --ensemble)
+    # What it does: terminal-stub pruning length (px) for --primary-only and
+    #   the ensemble Channel A worker.  Distinct from --prune-length (which
+    #   the full pipeline uses).  Removes branches shorter than this from
+    #   each skeleton.
+    # INCREASE (40-80) if: ensemble skeletons have many tiny branch
+    #   artifacts at noisy junctions.
+    # DECREASE (8-15) if: real short branches at root tips are being eaten.
+    # AVOID: > 100 — eats real laterals.
+    # INTERACTS WITH: primary_prune_passes (× this iteratively); also the
+    #   Channel B prune_length (fixed at 30 internally; unrelated).
     parser.add_argument(
         "--primary-prune-length", type=int, default=20, metavar="PX",
         dest="primary_prune_length",
@@ -5574,12 +6187,20 @@ Parameter-tuning notes
             "(default: 20)"
         ),
     )
+    # TUNE: primary_prune_passes (default 2)
+    # What it does: how many iterative rounds of stub pruning to run in
+    #   --primary-only / --ensemble.  Each pass can expose new short
+    #   branches for the next pass to remove.
+    # INCREASE (3-4) if: junction noise persists after one pass.
+    # DECREASE (1) if: pruning is over-aggressive even at small lengths.
+    # AVOID: > 6 — entire fine networks may collapse.
+    # INTERACTS WITH: primary_prune_length (effective removal ≈ length × passes).
     parser.add_argument(
         "--primary-prune-passes", type=int, default=2, metavar="N",
         dest="primary_prune_passes",
         help=(
             "Stub pruning passes in --primary-only / --complexity 1-2 mode.  "
-            "(default: 2)"
+            "(default: 2)  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5598,21 +6219,48 @@ Parameter-tuning notes
             "the resulting skeletons by pixel-level voting."
         ),
     )
+    # TUNE: ensemble_runs (default 10)
+    # What it does: how many parameter-sweep runs to execute per image when
+    #   --ensemble is active.  Each run varies tophat_percentile (linspace
+    #   75-92), and cycles blur_sigma {1.0, 1.5, 2.0} and close_radius
+    #   {1, 2, 3}.  Pixel votes are then merged across runs.
+    # INCREASE (15-20) if: votes are noisy / vote_threshold is hard to
+    #   choose because the heatmap looks blocky.  More runs → smoother vote
+    #   map → easier threshold selection.
+    # DECREASE (5-7) if: a single run already gives clean results and you
+    #   want speed.  Cost is roughly linear in --ensemble-runs.
+    # AVOID: < 3 — voting becomes meaningless.  > 30 — diminishing returns
+    #   and runtime blows out (≈ 4h for 17 4500×3000 images at 10 runs).
+    # INTERACTS WITH: vote_threshold (more runs → more granular voting,
+    #   so the same fractional threshold means a stricter cutoff).
     parser.add_argument(
         "--ensemble-runs", type=int, default=10, metavar="N", dest="ensemble_runs",
         help=(
             "Number of parameter-sweep runs in --ensemble mode.  Each run uses "
             "a distinct tophat_percentile value; blur_sigma and close_radius "
-            "cycle over their discrete values.  (default: 10)"
+            "cycle over their discrete values.  (default: 10)  # TUNE"
         ),
     )
+    # TUNE: vote_threshold (default 0.3)
+    # What it does: the fraction of ensemble runs that must independently
+    #   detect a skeleton pixel for it to appear in the final merged
+    #   skeleton.  0.3 = at least 30% of runs must agree.
+    # INCREASE (0.5-0.7) if: the merged skeleton still contains noise that
+    #   only a few unstable parameter combos detect.  Higher = more precise
+    #   but may miss faint or thin roots that only some runs pick up.
+    # DECREASE (0.15-0.2) if: real but faint roots vanish from the merged
+    #   skeleton because they are detected by only a minority of runs.
+    # AVOID: 0.0 — every run's noise gets through.  ≥ 0.9 — only ubiquitous
+    #   high-contrast roots survive (you may as well have run a single pass).
+    # INTERACTS WITH: ensemble_runs (more runs → smoother fractional vote
+    #   distribution → finer threshold control).
     parser.add_argument(
         "--vote-threshold", type=float, default=0.3, metavar="FRAC",
         dest="vote_threshold",
         help=(
             "Fraction of ensemble runs that must detect a skeleton pixel for it "
             "to appear in the merged output.  0.3 = 30%%.  Higher = more "
-            "precise, may miss faint roots.  (default: 0.3)"
+            "precise, may miss faint roots.  (default: 0.3)  # TUNE"
         ),
     )
     parser.add_argument(
@@ -5662,6 +6310,137 @@ Parameter-tuning notes
             "Relative weight of Channel B votes in the combined heatmap display.  "
             "Does not affect thresholding, only the _votes_combined.png output.  "
             "(default: 0.7)"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-min-roi-density", type=float, default=0.002, metavar="FRAC",
+        dest="ensemble_min_roi_density",
+        help=(
+            "Stage 4 (cross-image ROI matching) — minimum dilated-skeleton fraction "
+            "in a sliding window for it to qualify as an ROI candidate.  Lower than "
+            "the full pipeline's --min-roi-density because the input is a 1-px-wide "
+            "ensemble skeleton (dilated for this gate).  (default: 0.002)"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-min-skeleton-density", type=float, default=0.005, metavar="FRAC",
+        dest="ensemble_min_skeleton_density",
+        help=(
+            "Stage 4 — minimum skeleton density after per-ROI re-skeletonisation; "
+            "patches below this are dropped before cross-plant matching.  "
+            "(default: 0.005)"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-dilate-skeleton", type=int, default=2, metavar="PX",
+        dest="ensemble_dilate_skeleton",
+        help=(
+            "Stage 4 — dilate the merged ensemble skeleton by this radius (px) "
+            "before the density pre-filter so the 1-px skeleton has enough "
+            "coverage for windows to qualify.  Set 0 to disable.  (default: 2)"
+        ),
+    )
+
+    # ── Color-mask flags (chromaticity-suppression; ON by default) ───────────
+    # TUNE: color_gate_threshold (default 0.7)
+    # This filters out soil texture by requiring pixels to score above this
+    # threshold on the chromaticity-based root probability map.
+    # INCREASE (e.g. 0.8-0.9) if: soil is very light-colored or sandy and
+    #   being confused with roots; roots are unusually dark or brown-tipped.
+    # DECREASE (e.g. 0.4-0.6) if: roots are faint, discolored, or
+    #   soil-coated; images are low-contrast or taken under dim lighting.
+    # DISABLE (--no-color-gate) if: images are grayscale; color filter is
+    #   removing real roots; soil and root colors are similar.
+    parser.add_argument(
+        "--color-gate", type=float, default=0.7, metavar="PROB",
+        dest="color_gate",
+        help=(
+            "Threshold on the chromaticity-suppression color-root probability "
+            "mask.  A pixel is kept only if it passes BOTH the tophat "
+            "threshold AND color_mask > color_gate.  Higher = stricter color "
+            "match required.  Pass --no-color-gate to disable.  (default: 0.7)"
+        ),
+    )
+    parser.add_argument(
+        "--no-color-gate", action="store_true", dest="no_color_gate",
+        help=(
+            "Disable the color gate entirely.  Use for grayscale images, "
+            "or when soil/root colors are too similar for chromaticity to "
+            "discriminate."
+        ),
+    )
+    # TUNE: local_soil_radius (default 20.0 px sigma)
+    # What it does: Gaussian sigma for the local-mean soil chromaticity used
+    #   in the chromaticity-suppression color mask.  Defines the
+    #   neighbourhood ("how far out to look") when deciding whether a pixel
+    #   is "less brown than its local context".
+    # INCREASE (30-50) if: roots are wide / soil is uniformly colored over
+    #   large patches.  Larger sigma compares each pixel to a wider patch.
+    # DECREASE (8-12) if: soil color varies a lot across the image (uneven
+    #   wetting, lighting gradient).  Smaller sigma compares only against
+    #   nearby soil so chromaticity differences stay local.
+    # AVOID: < 4 — comparison is essentially against the pixel itself, no
+    #   discrimination.  > 100 — comparison is against the whole-image
+    #   average, loses spatial sensitivity.
+    # INTERACTS WITH: chroma_weight (how much this term contributes to the
+    #   final mask); local_lightness_radius (paired secondary signal).
+    parser.add_argument(
+        "--local-soil-radius", type=float, default=20.0, metavar="SIGMA",
+        dest="local_soil_radius",
+        help=(
+            "Gaussian sigma (px) for the local soil-chromaticity mean — the "
+            "neighbourhood over which 'less brown than the local mean' is "
+            "computed.  Larger = compares against a wider patch.  (default: 20)  # TUNE"
+        ),
+    )
+    # TUNE: local_lightness_radius (default 15.0 px sigma)
+    # ALIAS: this is the "root_lightness_sigma" parameter.
+    # What it does: Gaussian sigma for the local-mean lightness used in the
+    #   secondary lightness-contrast term of the color mask.  Picks up roots
+    #   that are *locally brighter* than surrounding soil.
+    # INCREASE (20-30) if: the secondary lightness term is too noisy and
+    #   adding random pixels to the mask.
+    # DECREASE (8-10) if: very thin roots are missed because the lightness
+    #   contrast is being averaged out over too large a neighbourhood.
+    # AVOID: < 4 (same self-comparison failure as local_soil_radius).
+    # INTERACTS WITH: chroma_weight (1 - chroma_weight is this term's
+    #   weight); local_soil_radius (paired primary signal).
+    parser.add_argument(
+        "--local-lightness-radius", type=float, default=15.0, metavar="SIGMA",
+        dest="local_lightness_radius",
+        help=(
+            "Gaussian sigma (px) for the secondary local-lightness mean.  "
+            "(default: 15)  # TUNE"
+        ),
+    )
+    parser.add_argument(
+        "--chroma-weight", type=float, default=0.7, metavar="W",
+        dest="chroma_weight",
+        help=(
+            "Weight of the chromaticity-suppression term in the combined "
+            "color probability (lightness contrast gets 1 - W).  Higher means "
+            "color does more of the work.  (default: 0.7)"
+        ),
+    )
+    parser.add_argument(
+        "--glare-percentile", type=float, default=98.0, metavar="PCT",
+        dest="glare_percentile",
+        help=(
+            "Specular-glare hard exclusion: zero out pixels where R, G, AND B "
+            "all exceed this percentile of interior pixel values.  "
+            "(default: 98)"
+        ),
+    )
+    parser.add_argument(
+        "--curated-skeletons", default=None, metavar="DIR",
+        dest="curated_skeletons",
+        help=(
+            "Directory containing manually curated skeletons produced by "
+            "curate_roots.py.  For any image where a "
+            "{stem}_curated_skeleton.png exists in this directory the "
+            "automated detection is bypassed and the curated skeleton is "
+            "used as if it were the ensemble output.  All downstream steps "
+            "(ROI extraction, matching, Stage 4 outputs) run identically."
         ),
     )
 
@@ -5891,6 +6670,20 @@ def main(argv: Optional[List[str]] = None) -> None:
             min_segment_length=args.min_segment_length,
             save_individual=args.save_individual_runs,
             n_jobs=args.n_jobs,
+            bins=args.bins,
+            metric=args.metric,
+            roi_size_px=args.roi_size,
+            roi_stride_px=args.roi_stride,
+            min_roi_density=args.ensemble_min_roi_density,
+            min_skeleton_density=args.ensemble_min_skeleton_density,
+            dilate_skeleton=args.ensemble_dilate_skeleton,
+            border_margin=args.border_margin,
+            color_gate=(None if args.no_color_gate else args.color_gate),
+            local_soil_radius=args.local_soil_radius,
+            local_lightness_radius=args.local_lightness_radius,
+            chroma_weight=args.chroma_weight,
+            glare_percentile=args.glare_percentile,
+            curated_skeletons_dir=args.curated_skeletons,
         ).run()
         return
 
@@ -5916,6 +6709,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             no_prune=args.no_prune,
             with_diameter=(complexity == 2),
             n_jobs=args.n_jobs,
+            color_gate=(None if args.no_color_gate else args.color_gate),
+            local_soil_radius=args.local_soil_radius,
+            local_lightness_radius=args.local_lightness_radius,
+            chroma_weight=args.chroma_weight,
+            glare_percentile=args.glare_percentile,
         )
         pipeline.run()
         return
